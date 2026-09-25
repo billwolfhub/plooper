@@ -56,7 +56,7 @@ which depends on the mode (SETUP `Reverb`):
 | Sub | Reverb fed back an octave down | Sub amount |
 | Backwards | Reverb tails played in reverse (they swell in) | Reverse window 100 ms–1.5 s |
 | Ghost | Backwards + shimmer | Shimmer amount (800 ms window) |
-| Freeze | Holds the reverb indefinitely | How much new sound still gets in |
+| Freeze | Holds the reverb indefinitely | How fast new sound fills it (0 = fully frozen); levels off on its own |
 
 ## Outputs
 
@@ -68,13 +68,17 @@ which depends on the mode (SETUP `Reverb`):
 | CV OUT 2 | Loop progress (0–5 V ramp) |
 | GATE OUT | Pulse at the start of each loop |
 
+All four audio outputs have soft limiters: clean below about 80% of full level, then peaks are rounded
+off instead of clipping. Overdubs are limited the same way, so a source left running in DUB levels off
+instead of building up into distortion.
+
 ## SETUP
 
 Click on the SETUP page to enter; turn to choose an item, click to edit it, click again to finish.
 Choose `< Pages` to go back to paging.
 
 Reverb mode, Dir A–D, Pan A–D (−100…+100), Snap (Off / Octaves / Musical: octaves and fifths),
-Gate 2, the Tape settings below, Input (Mono: IN 1 + IN 2 mixed / Stereo: IN 1 left, IN 2 right),
+Gate 2, the Tape settings below, Input (Mono IN1: IN 1 to both channels / Stereo: IN 1 left, IN 2 right),
 Monitor (On/Off), Clear loop. SETUP settings are saved to flash; knob page values are not.
 
 ## Tape (Frippertronics)
@@ -92,9 +96,23 @@ build up while older ones fade and darken on every pass.
 
 ## Display
 
-Header: page name and looper state (REC/DUB highlighted) with loop length. Below: the loop's waveform
+Header: page name, input level meter (a solid block at its right end means the input is clipping —
+turn the source down), and looper state (REC/DUB highlighted) with loop length. Below: the loop's waveform
 with the loop position, then one lane per head showing its window (dotted when muted) and position.
 Bottom: the page's four values, or the SETUP item.
+
+Shimmer, Sub, Ghost, and Freeze have automatic gain control on their feedback, and the input and
+reverb send are DC-blocked, so no mode can build up and swamp the output.
+
+## Testing on the Mac
+
+`sim/run.sh` builds Plooper's audio code for the Mac against stub hardware, records a test tone, plays
+it back, and prints input, OUT 1, and reverb levels every half second:
+
+```sh
+sim/run.sh 0 1          # no DC offset, Shimmer
+sim/run.sh 0.05 4 stress  # DC offset, Ghost, four heads full, DECAY/ODD max
+```
 
 ## Building
 

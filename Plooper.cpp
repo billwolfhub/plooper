@@ -130,6 +130,8 @@ enum LoopState { LOOP_EMPTY, LOOP_RECORDING, LOOP_PLAYING, LOOP_OVERDUB };
 const char *state_names[] = { "EMPTY", "REC", "PLAY", "DUB" };
 
 volatile int loop_state = LOOP_EMPTY;
+volatile float input_meter = 0.f; // Recent input peak, 0..1
+volatile uint32_t last_input_clip_millis = 0;
 volatile int loop_length = 0;
 volatile int record_position = 0; // Write position during the first take
 volatile int master_position = 0; // Speed-1 position, used for overdub and outputs
@@ -161,6 +163,27 @@ bool gate2_state = false;
 
 // Reverb state
 float shimmer_feedback = 0.f; // Last wet output, pitched back into the reverb
+float wet_envelope = 0.f; // Wet level, for the shimmer and freeze gain control
+float shimmer_highpass_x = 0.f; // One-pole highpass state on the feedback
+float shimmer_highpass_y = 0.f;
+// The pitched feedback adds energy on every trip round the reverb and would run
+// away to full scale; above this wet level, the feedback is turned down
+const float kShimmerTargetLevel = 0.3f;
+// Headroom inside the reverb; FX MIX makes it back up (knob 0..1 -> 0..2)
+const float kReverbSendLevel = 0.5f;
+
+// One-pole ~10 Hz highpass: keeps DC offsets out of recordings and out of the
+// long reverb feedback, which amplifies them enormously
+struct DcBlocker {
+    float x = 0.f, y = 0.f;
+    inline float Process(float input, float coefficient) {
+        y = coefficient * (y + input - x);
+        x = input;
+        return y;
+    }
+};
+DcBlocker input_dc_blocker[2];
+DcBlocker send_dc_blocker[2];
 struct ReverseReader {
     int start = 0;
     int phase = 0;
@@ -187,6 +210,18 @@ uint32_t last_screen_update_millis = 0;
 
 // ---------------------------------------------------------------------------
 // Helpers
+
+// Transparent below the knee, then rounds peaks off smoothly toward +/-1
+inline float PeakLimit(float x) {
+    const float knee = 0.8f;
+    float magnitude = fabsf(x);
+    if (magnitude <= knee) {
+        return x;
+    }
+    float over = (magnitude - knee) / (1.f - knee);
+    float limited = knee + (1.f - knee) * over / (1.f + over);
+    return x < 0.f ? -limited : limited;
+}
 
 inline float Saturate(float x) {
     if (x > 3.f) return 1.f;
@@ -349,6 +384,17 @@ void AdvanceReverse(int window) {
     reverse_write = (reverse_write + 1) % kReverseBufferSamples;
 }
 
+// Zeroes and re-initializes the reverb and shifter (they live in SDRAM)
+void ResetReverb() {
+    memset((void *)&reverb, 0, sizeof(reverb));
+    memset((void *)&shifter, 0, sizeof(shifter));
+    reverb.Init(sample_rate);
+    shifter.Init(sample_rate);
+    shimmer_feedback = 0.f;
+    wet_envelope = 0.f;
+    shimmer_highpass_x = shimmer_highpass_y = 0.f;
+}
+
 // ---------------------------------------------------------------------------
 // Audio
 
@@ -397,8 +443,9 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, s
 
         // Equal-power pan
         float p = (pan[h] + 100) / 200.f;
-        gain_l[h] = level[h] * cosf(p * PI_F * 0.5f) * 1.4142f;
-        gain_r[h] = level[h] * sinf(p * PI_F * 0.5f) * 1.4142f;
+        // Balance-style pan: centre is full level on both sides, never louder
+        gain_l[h] = level[h] * std::min(1.f, 2.f * (1.f - p));
+        gain_r[h] = level[h] * std::min(1.f, 2.f * p);
 
         if (playing && gate2_rise) {
             if (gate2_mode == GATE2_RETRIGGER) {
@@ -410,19 +457,28 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, s
     }
 
     // Reverb parameters
-    float fx_mix = page_value[PAGE_FX][0];
+    float fx_mix = page_value[PAGE_FX][0] * 2.f; // Makes up for kReverbSendLevel
+    const float dc_coefficient = 1.f - 2.f * PI_F * 10.f / sample_rate;
     float decay = page_value[PAGE_FX][1];
     float tone = page_value[PAGE_FX][2];
     float strange = page_value[PAGE_FX][3];
     bool freeze = reverb_mode == REVERB_FREEZE;
     reverb.SetFeedback(freeze ? 0.999f : 0.6f + decay * 0.38f);
     reverb.SetLpFreq(500.f * powf(36.f, tone));
-    float input_gain = freeze ? strange : 1.f;
+    // Freeze feeds back at 0.999, so input accumulates ~1000x: ODD lets a trickle
+    // in (0 = fully frozen), throttled as the reverb fills so it levels off
+    float input_gain = freeze
+        ? strange * 0.5f * std::min(1.f, kShimmerTargetLevel / std::max(wet_envelope, 1e-6f))
+        : 1.f;
     float shimmer_amount = 0.f;
+    // Highpass on the feedback keeps low end from piling up (lower for Sub)
+    float shimmer_highpass = 1.f - 2.f * PI_F * (reverb_mode == REVERB_SUB ? 30.f : 150.f) / sample_rate;
     if (reverb_mode == REVERB_SHIMMER || reverb_mode == REVERB_SUB || reverb_mode == REVERB_GHOST) {
         shimmer_amount = strange * 0.7f;
         shifter.SetTransposition(reverb_mode == REVERB_SUB ? -12.f : 12.f);
     }
+    const float envelope_attack = 1.f - expf(-1.f / (0.005f * sample_rate)); // 5 ms
+    const float envelope_release = 1.f - expf(-1.f / (0.3f * sample_rate)); // 300 ms
     bool reversed_tail = reverb_mode == REVERB_BACKWARDS || reverb_mode == REVERB_GHOST;
     int reverse_window = reverb_mode == REVERB_GHOST
         ? 38400 // 800 ms
@@ -445,11 +501,12 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, s
     const float wow_increment = 0.6f / sample_rate; // 0.6 Hz
     const float flutter_increment = 7.f / sample_rate; // 7 Hz
 
+    float block_input_peak = 0.f;
     for (size_t n = 0; n < size; n++) {
-        float in_l = in[0][n];
-        float in_r = in[1][n];
+        float in_l = input_dc_blocker[0].Process(in[0][n], dc_coefficient);
+        float in_r = input_dc_blocker[1].Process(in[1][n], dc_coefficient);
         if (!stereo_input) {
-            in_l = in_r = in_l + in_r;
+            in_r = in_l; // Mono: IN 1 to both channels
         }
 
         // Recording
@@ -474,7 +531,8 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, s
                     old += (Saturate(old * age_drive) / age_drive - old) * age * 0.5f;
                 }
                 float input = dubbing ? (c == 0 ? in_l : in_r) : 0.f;
-                loop_buffer[c][pos] = old * keep + input;
+                // Limited so a source left running in DUB can't build up forever
+                loop_buffer[c][pos] = PeakLimit(old * keep + input);
             }
         }
 
@@ -533,8 +591,10 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, s
         }
 
         // Reverb
-        float send_l = Saturate(heads_l * input_gain + shimmer_feedback * shimmer_amount);
-        float send_r = Saturate(heads_r * input_gain + shimmer_feedback * shimmer_amount);
+        float send_l = Saturate(send_dc_blocker[0].Process(heads_l, dc_coefficient) * input_gain * kReverbSendLevel
+            + shimmer_feedback * shimmer_amount);
+        float send_r = Saturate(send_dc_blocker[1].Process(heads_r, dc_coefficient) * input_gain * kReverbSendLevel
+            + shimmer_feedback * shimmer_amount);
         if (reverb_mode == REVERB_PLATE) {
             pre_delay[0].Write(send_l);
             pre_delay[1].Write(send_r);
@@ -543,11 +603,25 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, s
         }
         float wet_l, wet_r;
         reverb.Process(send_l, send_r, &wet_l, &wet_r);
+        float mono = 0.5f * (wet_l + wet_r);
+        float level = fabsf(mono);
+        wet_envelope += (level > wet_envelope ? envelope_attack : envelope_release)
+            * (level - wet_envelope);
         if (shimmer_amount > 0.f) {
-            float mono = 0.5f * (wet_l + wet_r);
-            shimmer_feedback = shifter.Process(mono);
+            float shifted = shifter.Process(mono);
+            // One-pole highpass
+            shimmer_highpass_y = shimmer_highpass * (shimmer_highpass_y + shifted - shimmer_highpass_x);
+            shimmer_highpass_x = shifted;
+            float gain_control = std::min(1.f, kShimmerTargetLevel / std::max(wet_envelope, 1e-6f));
+            shimmer_feedback = shimmer_highpass_y * gain_control;
         } else {
             shimmer_feedback = 0.f;
+        }
+        // A NaN/Inf would stay in the feedback loop and silence everything:
+        // reset the reverb instead
+        if (!std::isfinite(wet_l) || !std::isfinite(wet_r) || !std::isfinite(shimmer_feedback)) {
+            ResetReverb();
+            wet_l = wet_r = 0.f;
         }
         if (reversed_tail) {
             wet_l = ReverseProcess(0, wet_l, reverse_window);
@@ -557,10 +631,22 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, s
 
         float dry_l = monitor ? in_l : 0.f;
         float dry_r = monitor ? in_r : 0.f;
-        out[0][n] = heads_l + wet_l * fx_mix + dry_l;
-        out[1][n] = heads_r + wet_r * fx_mix + dry_r;
-        out[2][n] = wet_l;
-        out[3][n] = wet_r;
+        out[0][n] = PeakLimit(heads_l + wet_l * fx_mix + dry_l);
+        out[1][n] = PeakLimit(heads_r + wet_r * fx_mix + dry_r);
+        out[2][n] = PeakLimit(wet_l);
+        out[3][n] = PeakLimit(wet_r);
+
+        // Input meter
+        float input_peak = std::max(fabsf(in[0][n]), fabsf(in[1][n]));
+        if (input_peak > block_input_peak) {
+            block_input_peak = input_peak;
+        }
+    }
+
+    // Meter falls back ~20 dB per second; clip warning holds for half a second
+    input_meter = std::max(block_input_peak, input_meter * 0.9975f);
+    if (block_input_peak > 0.95f) {
+        last_input_clip_millis = System::GetNow();
     }
 
     // CV OUT 1: head A position, CV OUT 2: loop progress, GATE OUT: loop start
@@ -783,7 +869,7 @@ void SetupValueText(int item, char *text, size_t size) {
         case SETUP_DECAY: snprintf(text, size, "%s", decay_always ? "Always" : "Dub only"); break;
         case SETUP_AGE: snprintf(text, size, "%d%%", tape_age); break;
         case SETUP_WOW: snprintf(text, size, "%d%%", tape_wow); break;
-        case SETUP_INPUT: snprintf(text, size, "%s", stereo_input ? "Stereo" : "Mono"); break;
+        case SETUP_INPUT: snprintf(text, size, "%s", stereo_input ? "Stereo" : "Mono IN1"); break;
         case SETUP_MONITOR: snprintf(text, size, "%s", monitor ? "On" : "Off"); break;
         default: text[0] = 0; break;
     }
@@ -822,6 +908,17 @@ void DrawScreen() {
     // Header: page and looper state
     d.SetCursor(0, 0);
     d.WriteString(page_names[page], Font_6x8, true);
+
+    // Input meter between the page name and the state; solid end block = clipping
+    const int meter_x = 40, meter_width = 26;
+    d.DrawRect(meter_x, 1, meter_x + meter_width, 6, true, false);
+    int fill = (int)(std::min(1.f, (float)input_meter) * (meter_width - 2));
+    if (fill > 0) {
+        d.DrawRect(meter_x + 1, 2, meter_x + 1 + fill, 5, true, true);
+    }
+    if (System::GetNow() - last_input_clip_millis < 500 && last_input_clip_millis != 0) {
+        d.DrawRect(meter_x + meter_width + 2, 0, meter_x + meter_width + 4, 7, true, true);
+    }
     int state = loop_state;
     float seconds = (state == LOOP_RECORDING ? record_position : loop_length) / sample_rate;
     if (state == LOOP_EMPTY) {
@@ -918,13 +1015,14 @@ int main(void) {
     patch.Init();
     sample_rate = patch.AudioSampleRate();
 
-    // SDRAM isn't zeroed at boot
+    // SDRAM isn't zeroed at boot, and DaisySP's Init() functions assume it is
+    // (PitchShifter leaves several members unset, which would start as NaN)
     memset(loop_buffer, 0, sizeof(loop_buffer));
     memset(reverse_buffer, 0, sizeof(reverse_buffer));
-    reverb.Init(sample_rate);
-    shifter.Init(sample_rate);
+    memset((void *)pre_delay, 0, sizeof(pre_delay));
     pre_delay[0].Init();
     pre_delay[1].Init();
+    ResetReverb();
 
     LoadSettings();
 
