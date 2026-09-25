@@ -30,7 +30,7 @@ const uint32_t kWaveformRefreshMillis = 500;
 const uint32_t kSettingsSaveDelayMillis = 2000;
 // Separate from other firmwares' settings (grainwaves 0x7F0000, edges 0x7E0000)
 const uint32_t kSettingsQspiOffset = 0x7D0000;
-const uint32_t kSettingsVersion = 0x9100C001;
+const uint32_t kSettingsVersion = 0x9100C002;
 const float kPickupTolerance = 0.02f;
 
 DaisyPatch patch;
@@ -81,7 +81,10 @@ int direction[kNumHeads] = { DIR_FORWARD, DIR_FORWARD, DIR_FORWARD, DIR_FORWARD 
 int pan[kNumHeads] = { -30, 30, -60, 60 }; // -100..100
 int snap = SNAP_MUSICAL;
 int gate2_mode = GATE2_REVERSE;
-int dub_fade = 0; // Percent the loop fades on each overdub pass
+int dub_fade = 0; // Percent the loop fades on each pass while it's rewritten
+bool decay_always = false; // Tape: fade on every pass in PLAY too, not just DUB
+int tape_age = 0; // Tape: 0-100, each rewritten pass gets darker and saturated
+int tape_wow = 0; // Tape: 0-100, slow wobble and flutter on the heads
 bool stereo_input = false; // false: IN 1 + IN 2 mixed to both channels
 bool monitor = true; // Pass the input to OUT 1/2
 
@@ -89,11 +92,13 @@ bool monitor = true; // Pass the input to OUT 1/2
 enum SetupItem {
     SETUP_BACK, SETUP_REVERB, SETUP_DIR_A, SETUP_DIR_B, SETUP_DIR_C, SETUP_DIR_D,
     SETUP_PAN_A, SETUP_PAN_B, SETUP_PAN_C, SETUP_PAN_D, SETUP_SNAP, SETUP_GATE2,
-    SETUP_DUB_FADE, SETUP_INPUT, SETUP_MONITOR, SETUP_CLEAR, NUM_SETUP_ITEMS
+    SETUP_DUB_FADE, SETUP_DECAY, SETUP_AGE, SETUP_WOW, SETUP_INPUT, SETUP_MONITOR,
+    SETUP_CLEAR, NUM_SETUP_ITEMS
 };
 const char *setup_names[NUM_SETUP_ITEMS] = {
     "< Pages", "Reverb", "Dir A", "Dir B", "Dir C", "Dir D", "Pan A", "Pan B",
-    "Pan C", "Pan D", "Snap", "Gate 2", "Dub fade", "Input", "Monitor", "Clear loop"
+    "Pan C", "Pan D", "Snap", "Gate 2", "Dub fade", "Decay", "Age", "Wow", "Input",
+    "Monitor", "Clear loop"
 };
 
 struct Settings {
@@ -104,6 +109,9 @@ struct Settings {
     int32_t snap;
     int32_t gate2_mode;
     int32_t dub_fade;
+    int32_t tape_age;
+    int32_t tape_wow;
+    bool decay_always;
     bool stereo_input;
     bool monitor;
 
@@ -159,6 +167,12 @@ struct ReverseReader {
 };
 int reverse_write = 0;
 ReverseReader reverse_reader[2];
+
+// Tape aging: one-pole lowpass state along the loop, per channel
+float age_lowpass[2] = { 0.f, 0.f };
+// Tape wow (slow) and flutter (fast) oscillator phases, in cycles
+float wow_phase = 0.f;
+float flutter_phase = 0.f;
 
 // Encoder events latched in the audio callback (libDaisy's debounce needs ~1 kHz)
 volatile int32_t enc_delta_pending = 0;
@@ -418,7 +432,18 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, s
         pre_delay[0].SetDelay(delay);
         pre_delay[1].SetDelay(delay);
     }
+    // Tape: the loop is rewritten each pass in DUB, and in PLAY too with Decay: Always
     float keep = 1.f - dub_fade / 100.f;
+    bool rewrite = length > 0
+        && (loop_state == LOOP_OVERDUB || (decay_always && loop_state == LOOP_PLAYING));
+    float age = tape_age / 100.f;
+    // Age darkens each pass (down to a ~2.5 kHz one-pole at 100%) and saturates it
+    float age_coefficient = 1.f - age * 0.72f;
+    float age_drive = 1.f + age * 2.f;
+    float wow_depth = tape_wow / 100.f * 0.008f; // Up to +/-0.8% (about 14 cents)
+    float flutter_depth = tape_wow / 100.f * 0.0015f;
+    const float wow_increment = 0.6f / sample_rate; // 0.6 Hz
+    const float flutter_increment = 7.f / sample_rate; // 7 Hz
 
     for (size_t n = 0; n < size; n++) {
         float in_l = in[0][n];
@@ -437,10 +462,31 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, s
             if (record_position >= kMaxLoopSamples) {
                 ToggleRecording(); // Buffer full: close the loop
             }
-        } else if (loop_state == LOOP_OVERDUB && length > 0) {
+        } else if (rewrite) {
             int pos = master_position;
-            loop_buffer[0][pos] = loop_buffer[0][pos] * keep + in_l;
-            loop_buffer[1][pos] = loop_buffer[1][pos] * keep + in_r;
+            bool dubbing = loop_state == LOOP_OVERDUB;
+            for (int c = 0; c < 2; c++) {
+                float old = loop_buffer[c][pos];
+                if (age > 0.f) {
+                    // Filtering along the loop darkens it a little more each pass
+                    age_lowpass[c] += age_coefficient * (old - age_lowpass[c]);
+                    old = age_lowpass[c];
+                    old += (Saturate(old * age_drive) / age_drive - old) * age * 0.5f;
+                }
+                float input = dubbing ? (c == 0 ? in_l : in_r) : 0.f;
+                loop_buffer[c][pos] = old * keep + input;
+            }
+        }
+
+        // Tape wow and flutter bend every head's speed together
+        float wobble = 1.f;
+        if (tape_wow > 0) {
+            wow_phase += wow_increment;
+            if (wow_phase >= 1.f) wow_phase -= 1.f;
+            flutter_phase += flutter_increment;
+            if (flutter_phase >= 1.f) flutter_phase -= 1.f;
+            wobble += wow_depth * sinf(2.f * PI_F * wow_phase)
+                + flutter_depth * sinf(2.f * PI_F * flutter_phase);
         }
 
         // Playheads
@@ -458,7 +504,7 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, s
                     heads_r += ReadLoop(1, index) * envelope * gain_r[h];
                 }
 
-                head.position += speed[h] * head.bounce;
+                head.position += speed[h] * head.bounce * wobble;
                 if (head.position >= wl || head.position < 0.f) {
                     switch (direction[h]) {
                         case DIR_PINGPONG:
@@ -545,6 +591,9 @@ Settings CurrentSettings() {
     s.snap = snap;
     s.gate2_mode = gate2_mode;
     s.dub_fade = dub_fade;
+    s.tape_age = tape_age;
+    s.tape_wow = tape_wow;
+    s.decay_always = decay_always;
     s.stereo_input = stereo_input;
     s.monitor = monitor;
     return s;
@@ -565,6 +614,9 @@ void LoadSettings() {
     if (in_range(s.snap, 0, NUM_SNAPS - 1)) snap = s.snap;
     if (in_range(s.gate2_mode, 0, NUM_GATE2_MODES - 1)) gate2_mode = s.gate2_mode;
     if (in_range(s.dub_fade, 0, 50)) dub_fade = s.dub_fade;
+    if (in_range(s.tape_age, 0, 100)) tape_age = s.tape_age;
+    if (in_range(s.tape_wow, 0, 100)) tape_wow = s.tape_wow;
+    decay_always = s.decay_always;
     stereo_input = s.stereo_input;
     monitor = s.monitor;
 }
@@ -612,7 +664,10 @@ void AdjustSetupValue(int amount) {
         }
         case SETUP_SNAP: snap = Wrap(snap + amount, NUM_SNAPS); break;
         case SETUP_GATE2: gate2_mode = Wrap(gate2_mode + amount, NUM_GATE2_MODES); break;
-        case SETUP_DUB_FADE: dub_fade = std::max(0, std::min(50, dub_fade + amount * 5)); break;
+        case SETUP_DUB_FADE: dub_fade = std::max(0, std::min(50, dub_fade + amount)); break;
+        case SETUP_DECAY: decay_always = !decay_always; break;
+        case SETUP_AGE: tape_age = std::max(0, std::min(100, tape_age + amount * 5)); break;
+        case SETUP_WOW: tape_wow = std::max(0, std::min(100, tape_wow + amount * 5)); break;
         case SETUP_INPUT: stereo_input = !stereo_input; break;
         case SETUP_MONITOR: monitor = !monitor; break;
         default: return;
@@ -633,7 +688,8 @@ void OnEncoderClick() {
                 ui_mode = UI_PAGES;
             } else if (setup_item == SETUP_CLEAR) {
                 clear_requested = true;
-            } else if (setup_item == SETUP_INPUT || setup_item == SETUP_MONITOR) {
+            } else if (setup_item == SETUP_INPUT || setup_item == SETUP_MONITOR
+                       || setup_item == SETUP_DECAY) {
                 AdjustSetupValue(1); // Toggles
             } else {
                 ui_mode = UI_SETUP_EDIT;
@@ -724,6 +780,9 @@ void SetupValueText(int item, char *text, size_t size) {
         case SETUP_SNAP: snprintf(text, size, "%s", snap_names[snap]); break;
         case SETUP_GATE2: snprintf(text, size, "%s", gate2_names[gate2_mode]); break;
         case SETUP_DUB_FADE: snprintf(text, size, "%d%%", dub_fade); break;
+        case SETUP_DECAY: snprintf(text, size, "%s", decay_always ? "Always" : "Dub only"); break;
+        case SETUP_AGE: snprintf(text, size, "%d%%", tape_age); break;
+        case SETUP_WOW: snprintf(text, size, "%d%%", tape_wow); break;
         case SETUP_INPUT: snprintf(text, size, "%s", stereo_input ? "Stereo" : "Mono"); break;
         case SETUP_MONITOR: snprintf(text, size, "%s", monitor ? "On" : "Off"); break;
         default: text[0] = 0; break;
