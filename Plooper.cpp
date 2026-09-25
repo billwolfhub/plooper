@@ -25,12 +25,13 @@ const int kReverseBufferSamples = 48000 * 16 / 5; // 3.2 s, twice the longest re
 const int kPreDelaySamples = 24000; // 500 ms
 const uint32_t kLoopPulseMillis = 5;
 const uint32_t kEncoderHoldMillis = 1000;
+const uint32_t kEncoderPunchMillis = 250; // Hold-to-dub starts after this
 const uint32_t kScreenUpdateMillis = 16;
 const uint32_t kWaveformRefreshMillis = 500;
 const uint32_t kSettingsSaveDelayMillis = 2000;
 // Separate from other firmwares' settings (grainwaves 0x7F0000, edges 0x7E0000)
 const uint32_t kSettingsQspiOffset = 0x7D0000;
-const uint32_t kSettingsVersion = 0x9100C002;
+const uint32_t kSettingsVersion = 0x9100C003;
 const float kPickupTolerance = 0.02f;
 
 DaisyPatch patch;
@@ -48,9 +49,10 @@ DelayLine<float, kPreDelaySamples> DSY_SDRAM_BSS pre_delay[2];
 // ---------------------------------------------------------------------------
 // Settings
 
-enum Page { PAGE_MIX, PAGE_SPEED, PAGE_START, PAGE_LENGTH, PAGE_FX, PAGE_SETUP, NUM_PAGES };
+enum Page { PAGE_INPUT, PAGE_MIX, PAGE_SPEED, PAGE_START, PAGE_LENGTH, PAGE_FX, PAGE_SETUP, NUM_PAGES };
 const int kNumKnobPages = PAGE_SETUP;
-const char *page_names[NUM_PAGES] = { "MIX", "SPEED", "START", "LENGTH", "FX", "SETUP" };
+const char *page_names[NUM_PAGES] = { "INPUT", "MIX", "SPEED", "START", "LENGTH", "FX", "SETUP" };
+const char *input_labels[kNumHeads] = { "IN1", "IN2", "IN3", "IN4" };
 const char *fx_labels[kNumHeads] = { "MIX", "DECAY", "TONE", "ODD" };
 const char *head_labels[kNumHeads] = { "A", "B", "C", "D" };
 
@@ -63,11 +65,12 @@ const char *direction_names[NUM_DIRECTIONS] = { "Forward", "Reverse", "Pingpong"
 enum Snap { SNAP_OFF, SNAP_OCTAVES, SNAP_MUSICAL, NUM_SNAPS };
 const char *snap_names[NUM_SNAPS] = { "Off", "Octaves", "Musical" };
 
-enum Gate2Mode { GATE2_REVERSE, GATE2_RETRIGGER, GATE2_SCATTER, NUM_GATE2_MODES };
-const char *gate2_names[NUM_GATE2_MODES] = { "Reverse", "Retrig", "Scatter" };
+enum Gate2Mode { GATE2_REVERSE, GATE2_RETRIGGER, GATE2_SCATTER, GATE2_DUB, NUM_GATE2_MODES };
+const char *gate2_names[NUM_GATE2_MODES] = { "Reverse", "Retrig", "Scatter", "Dub" };
 
 // Knob page values, stored as knob positions 0..1
 float page_value[kNumKnobPages][kNumHeads] = {
+    { 1.f, 1.f, 0.f, 0.f }, // INPUT: levels of IN 1-4 into the loop and monitor
     { 0.8f, 0.f, 0.f, 0.f }, // MIX: only head A audible at first
     // SPEED: +1, -1, +0.5, +2 (see SpeedFromKnob)
     { 0.5f + 1.f / 3.f, 0.5f - 1.f / 3.f, 0.5f + 1.f / 6.f, 1.f },
@@ -87,17 +90,18 @@ int tape_age = 0; // Tape: 0-100, each rewritten pass gets darker and saturated
 int tape_wow = 0; // Tape: 0-100, slow wobble and flutter on the heads
 bool stereo_input = false; // false: IN 1 + IN 2 mixed to both channels
 bool monitor = true; // Pass the input to OUT 1/2
+bool encoder_momentary = false; // In PLAY, holding the encoder dubs while held
 
 // SETUP page items
 enum SetupItem {
     SETUP_BACK, SETUP_REVERB, SETUP_DIR_A, SETUP_DIR_B, SETUP_DIR_C, SETUP_DIR_D,
     SETUP_PAN_A, SETUP_PAN_B, SETUP_PAN_C, SETUP_PAN_D, SETUP_SNAP, SETUP_GATE2,
-    SETUP_DUB_FADE, SETUP_DECAY, SETUP_AGE, SETUP_WOW, SETUP_INPUT, SETUP_MONITOR,
+    SETUP_DUB_FADE, SETUP_DECAY, SETUP_AGE, SETUP_WOW, SETUP_ENCODER, SETUP_INPUT, SETUP_MONITOR,
     SETUP_CLEAR, NUM_SETUP_ITEMS
 };
 const char *setup_names[NUM_SETUP_ITEMS] = {
     "< Pages", "Reverb", "Dir A", "Dir B", "Dir C", "Dir D", "Pan A", "Pan B",
-    "Pan C", "Pan D", "Snap", "Gate 2", "Dub fade", "Decay", "Age", "Wow", "Input",
+    "Pan C", "Pan D", "Snap", "Gate 2", "Dub fade", "Decay", "Age", "Wow", "Encoder", "Input",
     "Monitor", "Clear loop"
 };
 
@@ -114,6 +118,7 @@ struct Settings {
     bool decay_always;
     bool stereo_input;
     bool monitor;
+    bool encoder_momentary;
 
     bool operator!=(const Settings &other) const {
         return memcmp(this, &other, sizeof(Settings)) != 0;
@@ -131,6 +136,9 @@ const char *state_names[] = { "EMPTY", "REC", "PLAY", "DUB" };
 
 volatile int loop_state = LOOP_EMPTY;
 volatile float input_meter = 0.f; // Recent input peak, 0..1
+float dub_amount = 0.f; // 0..1, ramps so dubbing punches in and out without clicks
+volatile bool punching_in = false; // A momentary dub is active, for the display
+volatile bool encoder_punch = false; // Encoder held for hold-to-dub
 volatile uint32_t last_input_clip_millis = 0;
 volatile int loop_length = 0;
 volatile int record_position = 0; // Write position during the first take
@@ -488,10 +496,25 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, s
         pre_delay[0].SetDelay(delay);
         pre_delay[1].SetDelay(delay);
     }
-    // Tape: the loop is rewritten each pass in DUB, and in PLAY too with Decay: Always
-    float keep = 1.f - dub_fade / 100.f;
-    bool rewrite = length > 0
-        && (loop_state == LOOP_OVERDUB || (decay_always && loop_state == LOOP_PLAYING));
+    // Dubbing: DUB state, or GATE IN 2 held high in PLAY with Gate 2 set to Dub
+    bool punch = loop_state == LOOP_PLAYING
+        && ((gate2_mode == GATE2_DUB && gate2) || encoder_punch);
+    punching_in = punch;
+    float dub_target = (loop_state == LOOP_OVERDUB || punch) ? 1.f : 0.f;
+    if (!playing) {
+        dub_amount = 0.f;
+    }
+    const float dub_ramp = 1.f / 480.f; // 10 ms
+
+    // Tape: the loop is rewritten while dubbing, and in PLAY too with Decay: Always
+    float fade = dub_fade / 100.f;
+    bool rewrite = playing && (dub_target > 0.f || dub_amount > 0.f || decay_always);
+
+    // Input levels (INPUT page)
+    float input_level[4];
+    for (int k = 0; k < 4; k++) {
+        input_level[k] = page_value[PAGE_INPUT][k];
+    }
     float age = tape_age / 100.f;
     // Age darkens each pass (down to a ~2.5 kHz one-pole at 100%) and saturates it
     float age_coefficient = 1.f - age * 0.72f;
@@ -503,11 +526,15 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, s
 
     float block_input_peak = 0.f;
     for (size_t n = 0; n < size; n++) {
-        float in_l = input_dc_blocker[0].Process(in[0][n], dc_coefficient);
-        float in_r = input_dc_blocker[1].Process(in[1][n], dc_coefficient);
-        if (!stereo_input) {
-            in_r = in_l; // Mono: IN 1 to both channels
-        }
+        // Stereo: IN 1 + IN 3 left, IN 2 + IN 4 right. Mono: all four to both.
+        float in_1 = in[0][n] * input_level[0];
+        float in_2 = in[1][n] * input_level[1];
+        float in_3 = in[2][n] * input_level[2];
+        float in_4 = in[3][n] * input_level[3];
+        float mix_l = stereo_input ? in_1 + in_3 : in_1 + in_2 + in_3 + in_4;
+        float mix_r = stereo_input ? in_2 + in_4 : mix_l;
+        float in_l = input_dc_blocker[0].Process(mix_l, dc_coefficient);
+        float in_r = input_dc_blocker[1].Process(mix_r, dc_coefficient);
 
         // Recording
         if (loop_state == LOOP_RECORDING) {
@@ -521,7 +548,13 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, s
             }
         } else if (rewrite) {
             int pos = master_position;
-            bool dubbing = loop_state == LOOP_OVERDUB;
+            if (dub_amount < dub_target) {
+                dub_amount = std::min(dub_target, dub_amount + dub_ramp);
+            } else if (dub_amount > dub_target) {
+                dub_amount = std::max(dub_target, dub_amount - dub_ramp);
+            }
+            // With Decay: Dub only, the loop fades only while dubbing
+            float keep = 1.f - fade * (decay_always ? 1.f : dub_amount);
             for (int c = 0; c < 2; c++) {
                 float old = loop_buffer[c][pos];
                 if (age > 0.f) {
@@ -530,7 +563,7 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, s
                     old = age_lowpass[c];
                     old += (Saturate(old * age_drive) / age_drive - old) * age * 0.5f;
                 }
-                float input = dubbing ? (c == 0 ? in_l : in_r) : 0.f;
+                float input = (c == 0 ? in_l : in_r) * dub_amount;
                 // Limited so a source left running in DUB can't build up forever
                 loop_buffer[c][pos] = PeakLimit(old * keep + input);
             }
@@ -637,7 +670,7 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, s
         out[3][n] = PeakLimit(wet_r);
 
         // Input meter
-        float input_peak = std::max(fabsf(in[0][n]), fabsf(in[1][n]));
+        float input_peak = std::max(fabsf(in_l), fabsf(in_r));
         if (input_peak > block_input_peak) {
             block_input_peak = input_peak;
         }
@@ -682,6 +715,7 @@ Settings CurrentSettings() {
     s.decay_always = decay_always;
     s.stereo_input = stereo_input;
     s.monitor = monitor;
+    s.encoder_momentary = encoder_momentary;
     return s;
 }
 
@@ -705,6 +739,7 @@ void LoadSettings() {
     decay_always = s.decay_always;
     stereo_input = s.stereo_input;
     monitor = s.monitor;
+    encoder_momentary = s.encoder_momentary;
 }
 
 void MarkSettingsChanged() {
@@ -730,6 +765,7 @@ int page = PAGE_MIX;
 int setup_item = SETUP_REVERB;
 bool encoder_press_armed = false;
 bool encoder_hold_fired = false;
+bool encoder_press_punches = false; // This press is a hold-to-dub
 
 inline int Wrap(int value, int count) {
     return ((value % count) + count) % count;
@@ -756,6 +792,7 @@ void AdjustSetupValue(int amount) {
         case SETUP_WOW: tape_wow = std::max(0, std::min(100, tape_wow + amount * 5)); break;
         case SETUP_INPUT: stereo_input = !stereo_input; break;
         case SETUP_MONITOR: monitor = !monitor; break;
+        case SETUP_ENCODER: encoder_momentary = !encoder_momentary; break;
         default: return;
     }
     MarkSettingsChanged();
@@ -775,7 +812,7 @@ void OnEncoderClick() {
             } else if (setup_item == SETUP_CLEAR) {
                 clear_requested = true;
             } else if (setup_item == SETUP_INPUT || setup_item == SETUP_MONITOR
-                       || setup_item == SETUP_DECAY) {
+                       || setup_item == SETUP_DECAY || setup_item == SETUP_ENCODER) {
                 AdjustSetupValue(1); // Toggles
             } else {
                 ui_mode = UI_SETUP_EDIT;
@@ -797,21 +834,29 @@ void UpdateUi() {
     enc_fall_pending = false;
     __enable_irq();
 
-    // Short click (on release) navigates; holding 1 s is the record button
+    // Short click (on release) navigates; holding 1 s is the record button.
+    // With Encoder: Momentary, holding during PLAY dubs while held instead.
     if (enc_rise) {
         encoder_press_armed = true;
         encoder_hold_fired = false;
+        encoder_press_punches = encoder_momentary && loop_state == LOOP_PLAYING;
     }
-    if (encoder_press_armed && !encoder_hold_fired && patch.encoder.Pressed()
-            && patch.encoder.TimeHeldMs() >= kEncoderHoldMillis) {
-        encoder_hold_fired = true;
-        record_toggle_requested = true;
+    if (encoder_press_armed && !encoder_hold_fired && patch.encoder.Pressed()) {
+        uint32_t held = patch.encoder.TimeHeldMs();
+        if (encoder_press_punches && held >= kEncoderPunchMillis) {
+            encoder_hold_fired = true;
+            encoder_punch = true;
+        } else if (!encoder_press_punches && held >= kEncoderHoldMillis) {
+            encoder_hold_fired = true;
+            record_toggle_requested = true;
+        }
     }
     if (enc_fall) {
         if (encoder_press_armed && !encoder_hold_fired) {
             OnEncoderClick();
         }
         encoder_press_armed = false;
+        encoder_punch = false;
     }
 
     if (enc != 0) {
@@ -869,8 +914,9 @@ void SetupValueText(int item, char *text, size_t size) {
         case SETUP_DECAY: snprintf(text, size, "%s", decay_always ? "Always" : "Dub only"); break;
         case SETUP_AGE: snprintf(text, size, "%d%%", tape_age); break;
         case SETUP_WOW: snprintf(text, size, "%d%%", tape_wow); break;
-        case SETUP_INPUT: snprintf(text, size, "%s", stereo_input ? "Stereo" : "Mono IN1"); break;
+        case SETUP_INPUT: snprintf(text, size, "%s", stereo_input ? "Stereo" : "Mono"); break;
         case SETUP_MONITOR: snprintf(text, size, "%s", monitor ? "On" : "Off"); break;
+        case SETUP_ENCODER: snprintf(text, size, "%s", encoder_momentary ? "Momentary" : "Toggle"); break;
         default: text[0] = 0; break;
     }
 }
@@ -921,6 +967,9 @@ void DrawScreen() {
     }
     int state = loop_state;
     float seconds = (state == LOOP_RECORDING ? record_position : loop_length) / sample_rate;
+    if (state == LOOP_PLAYING && punching_in) {
+        state = LOOP_OVERDUB; // Gate 2 punch-in shows as DUB
+    }
     if (state == LOOP_EMPTY) {
         snprintf(text, sizeof(text), "%s", state_names[state]);
     } else {
@@ -975,7 +1024,8 @@ void DrawScreen() {
         // Four columns: label, value, and a dot if the knob hasn't picked up yet
         for (int c = 0; c < kNumHeads; c++) {
             int x = c * 32 + 1;
-            const char *label = page == PAGE_FX ? fx_labels[c] : head_labels[c];
+            const char *label = page == PAGE_FX ? fx_labels[c]
+                : page == PAGE_INPUT ? input_labels[c] : head_labels[c];
             d.SetCursor(x, kLabelY);
             d.WriteString(label, Font_6x8, true);
             PageValueText(page, c, text, sizeof(text));

@@ -13,6 +13,14 @@ feed a reverb with six modes, including reversed tails and pitch-shifted feedbac
 EMPTY → **REC** (first take) → PLAY → **DUB** (overdub) → PLAY → DUB …
 
 The first take sets the loop length (it closes automatically at 60 s). `Clear loop` in SETUP empties it.
+
+**Momentary dub:** with SETUP `Gate 2` set to *Dub*, GATE IN 2 held high while in PLAY dubs the inputs
+in only while the gate is high (10 ms fades, so punching in and out doesn't click); the header shows DUB.
+The INPUT page levels set how much of each input gets dubbed, so you can also ride them while in DUB.
+
+**Hold-to-dub:** with SETUP `Encoder` set to *Momentary*, holding the encoder for a quarter second while
+in PLAY dubs until you let go (quick clicks still navigate). Recording the first take and closing the
+loop still use the 1 s hold; in PLAY the hold no longer latches DUB (GATE IN 1 still toggles it).
 While overdubbing, `Dub fade` fades the old material a little on each pass (see Tape).
 
 ## Pages
@@ -22,6 +30,7 @@ for one head** (knob 1 = A … knob 4 = D), so every head has its own knob on ev
 
 | Page | Knob sets | Range |
 |---|---|---|
+| INPUT | Level of IN 1–4 into the loop and monitor | 0–100 (IN 1 and IN 2 start full, IN 3–4 off) |
 | MIX | Head level | 0–100 |
 | SPEED | Head speed | CCW half reverse, CW half forward, 0.25×–2× each way |
 | START | Where the head's window begins | 0–100% of the loop |
@@ -41,7 +50,8 @@ Default speeds are A +1, B −1, C +0.5, D +2. At power-up the knobs set the MIX
 - **Dir A–D** (SETUP): Forward, Reverse (flips the speed), Pingpong (bounces between the window
   ends), Random (jumps to a random spot each time around the window).
 - **GATE IN 2** (SETUP `Gate 2`): *Reverse* flips every head while the gate is high; *Retrig* sends
-  every head to its window start; *Scatter* sends every head to a random spot.
+  every head to its window start; *Scatter* sends every head to a random spot; *Dub* punches in (see
+  below).
 - **Backwards** and **Ghost** reverbs reverse the reverb tail.
 
 ## Reverb
@@ -78,7 +88,8 @@ Click on the SETUP page to enter; turn to choose an item, click to edit it, clic
 Choose `< Pages` to go back to paging.
 
 Reverb mode, Dir A–D, Pan A–D (−100…+100), Snap (Off / Octaves / Musical: octaves and fifths),
-Gate 2, the Tape settings below, Input (Mono IN1: IN 1 to both channels / Stereo: IN 1 left, IN 2 right),
+Gate 2, the Tape settings below, Encoder (Toggle / Momentary), Input (Mono: IN 1–4 mixed to both channels / Stereo: IN 1 + IN 3 left,
+IN 2 + IN 4 right),
 Monitor (On/Off), Clear loop. SETUP settings are saved to flash; knob page values are not.
 
 ## Tape (Frippertronics)

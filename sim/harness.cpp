@@ -63,4 +63,11 @@ int main(int argc, char** argv) {
     Run(2, 0.5f, dc, "empty");
     record_toggle_requested = true; Run(4, 0.5f, dc, "rec");
     record_toggle_requested = true; Run(stress ? 30 : 10, 0.5f, dc, "play");
+    if (getenv("PUNCH")) {
+        // Gate 2 Dub: punch in for 2 s with input, then release and mute the input
+        gate2_mode = GATE2_DUB;
+        monitor = false;
+        patch.gate_input[1].high = true;  Run(2, 0.5f, dc, "punch");
+        patch.gate_input[1].high = false; Run(4, 0.f, dc, "after");
+    }
 }
