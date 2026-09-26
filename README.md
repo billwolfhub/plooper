@@ -8,19 +8,23 @@ feed a reverb with six modes, including reversed tails and pitch-shifted feedbac
 
 ## Recording
 
-**GATE IN 1** trigger or **holding the encoder for 1 s** steps through:
+**Encoder** (on the play pages — on the SETUP page every press is just a click):
 
-EMPTY → **REC** (first take) → PLAY → **DUB** (overdub) → PLAY → DUB …
+| State | Press | Result |
+|---|---|---|
+| EMPTY | Hold 1 s | Start the first take (REC) |
+| REC | Hold 1 s | Close the loop → PLAY |
+| PLAY | Press and hold | **Records while held**, from the instant you press (10 ms fades, no clicks). The header shows DUB. |
+| PLAY | Keep holding past `Latch after` (default 2 loops, at least 4 s) | **Latches DUB** — keeps recording after you let go. A bar along the top of the waveform fills as you approach it. |
+| DUB | Click | Back to PLAY |
+
+**GATE IN 1:** each trigger steps EMPTY → REC → PLAY → DUB → PLAY → DUB …
 
 The first take sets the loop length (it closes automatically at 60 s). `Clear loop` in SETUP empties it.
 
-**Momentary dub:** with SETUP `Gate 2` set to *Dub*, GATE IN 2 held high while in PLAY dubs the inputs
-in only while the gate is high (10 ms fades, so punching in and out doesn't click); the header shows DUB.
-The INPUT page levels set how much of each input gets dubbed, so you can also ride them while in DUB.
-
-**Hold-to-dub:** with SETUP `Encoder` set to *Momentary*, holding the encoder for a quarter second while
-in PLAY dubs until you let go (quick clicks still navigate). Recording the first take and closing the
-loop still use the 1 s hold; in PLAY the hold no longer latches DUB (GATE IN 1 still toggles it).
+**Gate punch-in:** with SETUP `Gate 2` set to *Dub*, GATE IN 2 held high while in PLAY dubs the inputs
+in only while the gate is high. The INPUT page levels set how much of each input gets dubbed, so you can
+also ride them while in DUB.
 While overdubbing, `Dub fade` fades the old material a little on each pass (see Tape).
 
 ## Pages
@@ -85,10 +89,11 @@ instead of building up into distortion.
 ## SETUP
 
 Click on the SETUP page to enter; turn to choose an item, click to edit it, click again to finish.
-Choose `< Pages` to go back to paging.
+Choose `< Pages` to go back to paging, or leave the encoder alone for 6 s and SETUP returns to the last play page by itself.
+On the SETUP page, holding the encoder does nothing special (no punch-in or record) — every press is a click.
 
 Reverb mode, Dir A–D, Pan A–D (−100…+100), Snap (Off / Octaves / Musical: octaves and fifths),
-Gate 2, the Tape settings below, Encoder (Toggle / Momentary), Input (Mono: IN 1–4 mixed to both channels / Stereo: IN 1 + IN 3 left,
+Gate 2, the Tape settings below, Latch after (1 / 2 / 4 loops / Never), Input (Mono: IN 1–4 mixed to both channels / Stereo: IN 1 + IN 3 left,
 IN 2 + IN 4 right),
 Monitor (On/Off), Clear loop. SETUP settings are saved to flash; knob page values are not.
 

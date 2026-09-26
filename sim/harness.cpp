@@ -26,6 +26,7 @@ void Run(float seconds, float amp, float dc, const char* label) {
         }
         AudioCallback(ins, outs, 48);
         daisy::System::now_ms++;
+        UpdateUi();
         for (int n = 0; n < 48; n++) {
             sum_main += out_buf[0][n] * out_buf[0][n];
             sum_verb += out_buf[2][n] * out_buf[2][n];
@@ -33,9 +34,9 @@ void Run(float seconds, float amp, float dc, const char* label) {
             count++;
         }
         if ((b + 1) % 500 == 0) {
-            printf("%-6s t=%5.1fs  in=%.3f  OUT1=%.3f  reverb(OUT3)=%.3f  state=%s\n", label,
+            printf("%-6s t=%5.1fs  in=%.3f  OUT1=%.3f  reverb(OUT3)=%.3f  state=%s%s\n", label,
                    daisy::System::now_ms / 1000.0, sqrt(sum_in / count), sqrt(sum_main / count),
-                   sqrt(sum_verb / count), state_names[loop_state]);
+                   sqrt(sum_verb / count), state_names[loop_state], punching_in ? " (punching)" : "");
             sum_main = sum_verb = sum_in = 0; count = 0;
         }
     }
@@ -63,6 +64,24 @@ int main(int argc, char** argv) {
     Run(2, 0.5f, dc, "empty");
     record_toggle_requested = true; Run(4, 0.5f, dc, "rec");
     record_toggle_requested = true; Run(stress ? 30 : 10, 0.5f, dc, "play");
+    if (getenv("FADE")) {
+        // Decay: Always, Dub fade 10%, input muted: the first take alone should fade
+        decay_always = getenv("DUBONLY") == nullptr;
+        dub_fade = 10;
+        monitor = false;
+        Run(20, 0.f, dc, "fade");
+    }
+    if (getenv("LATCH")) {
+        // Encoder: hold 2 s (punch), release; hold past 2 loops (8 s) -> latch; click -> PLAY
+        monitor = false;
+        page = requested_page = PAGE_MIX;
+        patch.encoder.down = true;  Run(2, 0.5f, dc, "hold2s");
+        patch.encoder.down = false; Run(1, 0.f, dc, "release");
+        patch.encoder.down = true;  Run(9, 0.5f, dc, "hold9s");
+        patch.encoder.down = false; Run(2, 0.5f, dc, "latched");
+        patch.encoder.down = true;  Run(0.1f, 0.5f, dc, "click");
+        patch.encoder.down = false; Run(2, 0.5f, dc, "after");
+    }
     if (getenv("PUNCH")) {
         // Gate 2 Dub: punch in for 2 s with input, then release and mute the input
         gate2_mode = GATE2_DUB;

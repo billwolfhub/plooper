@@ -25,13 +25,14 @@ const int kReverseBufferSamples = 48000 * 16 / 5; // 3.2 s, twice the longest re
 const int kPreDelaySamples = 24000; // 500 ms
 const uint32_t kLoopPulseMillis = 5;
 const uint32_t kEncoderHoldMillis = 1000;
-const uint32_t kEncoderPunchMillis = 250; // Hold-to-dub starts after this
+const uint32_t kLatchMinimumMillis = 4000; // Shortest hold that latches DUB
+const uint32_t kSetupTimeoutMillis = 6000; // Idle time before SETUP returns to play
 const uint32_t kScreenUpdateMillis = 16;
 const uint32_t kWaveformRefreshMillis = 500;
 const uint32_t kSettingsSaveDelayMillis = 2000;
 // Separate from other firmwares' settings (grainwaves 0x7F0000, edges 0x7E0000)
 const uint32_t kSettingsQspiOffset = 0x7D0000;
-const uint32_t kSettingsVersion = 0x9100C003;
+const uint32_t kSettingsVersion = 0x9100C004;
 const float kPickupTolerance = 0.02f;
 
 DaisyPatch patch;
@@ -90,18 +91,18 @@ int tape_age = 0; // Tape: 0-100, each rewritten pass gets darker and saturated
 int tape_wow = 0; // Tape: 0-100, slow wobble and flutter on the heads
 bool stereo_input = false; // false: IN 1 + IN 2 mixed to both channels
 bool monitor = true; // Pass the input to OUT 1/2
-bool encoder_momentary = false; // In PLAY, holding the encoder dubs while held
+int latch_loops = 2; // Holding a punch this many loops latches DUB (0 = never)
 
 // SETUP page items
 enum SetupItem {
     SETUP_BACK, SETUP_REVERB, SETUP_DIR_A, SETUP_DIR_B, SETUP_DIR_C, SETUP_DIR_D,
     SETUP_PAN_A, SETUP_PAN_B, SETUP_PAN_C, SETUP_PAN_D, SETUP_SNAP, SETUP_GATE2,
-    SETUP_DUB_FADE, SETUP_DECAY, SETUP_AGE, SETUP_WOW, SETUP_ENCODER, SETUP_INPUT, SETUP_MONITOR,
+    SETUP_DUB_FADE, SETUP_DECAY, SETUP_AGE, SETUP_WOW, SETUP_LATCH, SETUP_INPUT, SETUP_MONITOR,
     SETUP_CLEAR, NUM_SETUP_ITEMS
 };
 const char *setup_names[NUM_SETUP_ITEMS] = {
     "< Pages", "Reverb", "Dir A", "Dir B", "Dir C", "Dir D", "Pan A", "Pan B",
-    "Pan C", "Pan D", "Snap", "Gate 2", "Dub fade", "Decay", "Age", "Wow", "Encoder", "Input",
+    "Pan C", "Pan D", "Snap", "Gate 2", "Dub fade", "Decay", "Age", "Wow", "Latch after", "Input",
     "Monitor", "Clear loop"
 };
 
@@ -118,7 +119,7 @@ struct Settings {
     bool decay_always;
     bool stereo_input;
     bool monitor;
-    bool encoder_momentary;
+    int32_t latch_loops;
 
     bool operator!=(const Settings &other) const {
         return memcmp(this, &other, sizeof(Settings)) != 0;
@@ -138,7 +139,8 @@ volatile int loop_state = LOOP_EMPTY;
 volatile float input_meter = 0.f; // Recent input peak, 0..1
 float dub_amount = 0.f; // 0..1, ramps so dubbing punches in and out without clicks
 volatile bool punching_in = false; // A momentary dub is active, for the display
-volatile bool encoder_punch = false; // Encoder held for hold-to-dub
+volatile bool encoder_punch = false; // Encoder held for a punch-in (set in the audio callback)
+volatile float latch_progress = -1.f; // 0..1 while a punch heads toward latching DUB, else < 0
 volatile uint32_t last_input_clip_millis = 0;
 volatile int loop_length = 0;
 volatile int record_position = 0; // Write position during the first take
@@ -410,8 +412,17 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, s
     patch.ProcessAnalogControls();
     patch.encoder.Debounce();
     enc_delta_pending += patch.encoder.Increment();
-    if (patch.encoder.RisingEdge()) enc_rise_pending = true;
-    if (patch.encoder.FallingEdge()) enc_fall_pending = true;
+    if (patch.encoder.RisingEdge()) {
+        enc_rise_pending = true;
+        // Punch in on the press itself, on the play pages while the loop plays
+        if (requested_page != PAGE_SETUP && loop_state == LOOP_PLAYING) {
+            encoder_punch = true;
+        }
+    }
+    if (patch.encoder.FallingEdge()) {
+        enc_fall_pending = true;
+        encoder_punch = false;
+    }
 
     UpdateKnobs();
 
@@ -715,7 +726,7 @@ Settings CurrentSettings() {
     s.decay_always = decay_always;
     s.stereo_input = stereo_input;
     s.monitor = monitor;
-    s.encoder_momentary = encoder_momentary;
+    s.latch_loops = latch_loops;
     return s;
 }
 
@@ -739,7 +750,7 @@ void LoadSettings() {
     decay_always = s.decay_always;
     stereo_input = s.stereo_input;
     monitor = s.monitor;
-    encoder_momentary = s.encoder_momentary;
+    if (s.latch_loops == 0 || s.latch_loops == 1 || s.latch_loops == 2 || s.latch_loops == 4) latch_loops = s.latch_loops;
 }
 
 void MarkSettingsChanged() {
@@ -762,10 +773,13 @@ void SaveSettingsIfNeeded() {
 enum UiMode { UI_PAGES, UI_SETUP_NAV, UI_SETUP_EDIT };
 int ui_mode = UI_PAGES;
 int page = PAGE_MIX;
+int last_play_page = PAGE_MIX; // Where the SETUP timeout returns to
+uint32_t last_encoder_activity_millis = 0;
 int setup_item = SETUP_REVERB;
 bool encoder_press_armed = false;
 bool encoder_hold_fired = false;
-bool encoder_press_punches = false; // This press is a hold-to-dub
+enum PressAction { PRESS_CLICK, PRESS_RECORD, PRESS_PUNCH, PRESS_LEAVE_DUB };
+int press_action = PRESS_CLICK; // What the current encoder press does
 
 inline int Wrap(int value, int count) {
     return ((value % count) + count) % count;
@@ -792,7 +806,14 @@ void AdjustSetupValue(int amount) {
         case SETUP_WOW: tape_wow = std::max(0, std::min(100, tape_wow + amount * 5)); break;
         case SETUP_INPUT: stereo_input = !stereo_input; break;
         case SETUP_MONITOR: monitor = !monitor; break;
-        case SETUP_ENCODER: encoder_momentary = !encoder_momentary; break;
+        case SETUP_LATCH: {
+            // 1, 2, 4 loops, Never
+            static const int choices[] = { 1, 2, 4, 0 };
+            int index = 0;
+            while (choices[index] != latch_loops) index++;
+            latch_loops = choices[Wrap(index + amount, 4)];
+            break;
+        }
         default: return;
     }
     MarkSettingsChanged();
@@ -812,7 +833,7 @@ void OnEncoderClick() {
             } else if (setup_item == SETUP_CLEAR) {
                 clear_requested = true;
             } else if (setup_item == SETUP_INPUT || setup_item == SETUP_MONITOR
-                       || setup_item == SETUP_DECAY || setup_item == SETUP_ENCODER) {
+                       || setup_item == SETUP_DECAY) {
                 AdjustSetupValue(1); // Toggles
             } else {
                 ui_mode = UI_SETUP_EDIT;
@@ -834,29 +855,51 @@ void UpdateUi() {
     enc_fall_pending = false;
     __enable_irq();
 
-    // Short click (on release) navigates; holding 1 s is the record button.
-    // With Encoder: Momentary, holding during PLAY dubs while held instead.
+    // Encoder presses on the play pages:
+    //   EMPTY / REC: hold 1 s to start or close the first take
+    //   PLAY: records while held (the audio callback punches in on the press);
+    //         holding past `Latch after` loops (4 s minimum) latches DUB
+    //   DUB: a click goes back to PLAY
+    // On the SETUP page every press is a click, so navigating can't dub.
     if (enc_rise) {
         encoder_press_armed = true;
         encoder_hold_fired = false;
-        encoder_press_punches = encoder_momentary && loop_state == LOOP_PLAYING;
+        int state = loop_state;
+        if (page == PAGE_SETUP) {
+            press_action = PRESS_CLICK;
+        } else if (state == LOOP_PLAYING) {
+            press_action = PRESS_PUNCH;
+        } else if (state == LOOP_OVERDUB) {
+            press_action = PRESS_LEAVE_DUB;
+        } else {
+            press_action = PRESS_RECORD;
+        }
     }
+    latch_progress = -1.f;
     if (encoder_press_armed && !encoder_hold_fired && patch.encoder.Pressed()) {
         uint32_t held = patch.encoder.TimeHeldMs();
-        if (encoder_press_punches && held >= kEncoderPunchMillis) {
-            encoder_hold_fired = true;
-            encoder_punch = true;
-        } else if (!encoder_press_punches && held >= kEncoderHoldMillis) {
+        if (press_action == PRESS_RECORD && held >= kEncoderHoldMillis) {
             encoder_hold_fired = true;
             record_toggle_requested = true;
+        } else if (press_action == PRESS_PUNCH && latch_loops > 0 && loop_length > 0) {
+            float loop_millis = loop_length / sample_rate * 1000.f;
+            float threshold = std::max((float)kLatchMinimumMillis, loop_millis * latch_loops);
+            latch_progress = std::min(1.f, held / threshold);
+            if (held >= threshold) {
+                encoder_hold_fired = true;
+                record_toggle_requested = true; // PLAY -> DUB
+            }
         }
     }
     if (enc_fall) {
         if (encoder_press_armed && !encoder_hold_fired) {
-            OnEncoderClick();
+            if (press_action == PRESS_CLICK) {
+                OnEncoderClick();
+            } else if (press_action == PRESS_LEAVE_DUB) {
+                record_toggle_requested = true; // DUB -> PLAY
+            }
         }
         encoder_press_armed = false;
-        encoder_punch = false;
     }
 
     if (enc != 0) {
@@ -864,6 +907,9 @@ void UpdateUi() {
             case UI_PAGES:
                 page = std::max(0, std::min(NUM_PAGES - 1, page + enc));
                 requested_page = page;
+                if (page != PAGE_SETUP) {
+                    last_play_page = page;
+                }
                 break;
             case UI_SETUP_NAV:
                 setup_item = std::max(0, std::min(NUM_SETUP_ITEMS - 1, setup_item + enc));
@@ -872,6 +918,18 @@ void UpdateUi() {
                 AdjustSetupValue(enc);
                 break;
         }
+    }
+
+    // Leave SETUP after a few idle seconds so the play pages come back.
+    // Holding the encoder (e.g. a long punch-in) counts as activity.
+    uint32_t now = System::GetNow();
+    if (enc != 0 || enc_rise || enc_fall || patch.encoder.Pressed()) {
+        last_encoder_activity_millis = now;
+    }
+    if (page == PAGE_SETUP && now - last_encoder_activity_millis >= kSetupTimeoutMillis) {
+        ui_mode = UI_PAGES;
+        page = last_play_page;
+        requested_page = page;
     }
 }
 
@@ -916,7 +974,10 @@ void SetupValueText(int item, char *text, size_t size) {
         case SETUP_WOW: snprintf(text, size, "%d%%", tape_wow); break;
         case SETUP_INPUT: snprintf(text, size, "%s", stereo_input ? "Stereo" : "Mono"); break;
         case SETUP_MONITOR: snprintf(text, size, "%s", monitor ? "On" : "Off"); break;
-        case SETUP_ENCODER: snprintf(text, size, "%s", encoder_momentary ? "Momentary" : "Toggle"); break;
+        case SETUP_LATCH:
+            if (latch_loops == 0) snprintf(text, size, "Never");
+            else snprintf(text, size, "%d loop%s", latch_loops, latch_loops == 1 ? "" : "s");
+            break;
         default: text[0] = 0; break;
     }
 }
@@ -984,6 +1045,12 @@ void DrawScreen() {
     } else {
         d.SetCursor(128 - width, 0);
         d.WriteString(text, Font_6x8, true);
+    }
+
+    // A held punch heading toward latching DUB: bar fills along the top
+    float progress = latch_progress;
+    if (progress >= 0.f) {
+        d.DrawLine(0, kWaveTop - 1, (int)(progress * 127), kWaveTop - 1, true);
     }
 
     int length = loop_length;
@@ -1092,8 +1159,11 @@ int main(void) {
         SaveSettingsIfNeeded();
 
         uint32_t now = System::GetNow();
+        // The loop can change whenever it plays (latched DUB, momentary punch-ins,
+        // Decay: Always), so redraw it regularly
+        bool playing_now = loop_state == LOOP_PLAYING || loop_state == LOOP_OVERDUB;
         bool refresh = waveform_dirty
-            || (loop_state == LOOP_OVERDUB && now - last_waveform_millis >= kWaveformRefreshMillis);
+            || (playing_now && now - last_waveform_millis >= kWaveformRefreshMillis);
         if (refresh) {
             waveform_dirty = false;
             last_waveform_millis = now;

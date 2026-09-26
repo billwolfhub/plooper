@@ -27,12 +27,15 @@ struct QSPIHandle {};
 struct GPIO { bool state = false; void Write(bool s) { state = s; } };
 struct GateIn { bool high = false; bool State() { return high; } bool Trig() { return false; } };
 struct Encoder {
-    void Debounce() {}
+    // Set `down` from the harness; Debounce() turns changes into edges
+    bool down = false, state = false, rising = false, falling = false;
+    uint32_t press_time = 0;
+    void Debounce();
     int Increment() { return 0; }
-    bool RisingEdge() { return false; }
-    bool FallingEdge() { return false; }
-    bool Pressed() { return false; }
-    float TimeHeldMs() { return 0; }
+    bool RisingEdge() { return rising; }
+    bool FallingEdge() { return falling; }
+    bool Pressed() { return state; }
+    float TimeHeldMs();
 };
 struct Display {
     void Fill(bool) {} void SetCursor(int, int) {} void WriteString(const char*, FontDef, bool) {}
@@ -51,4 +54,11 @@ class DaisyPatch {
     void ProcessAnalogControls() {}
     float GetKnobValue(Ctrl k) { return knobs[k]; }
 };
+inline void Encoder::Debounce() {
+    rising = down && !state;
+    falling = !down && state;
+    if (rising) press_time = System::GetNow();
+    state = down;
+}
+inline float Encoder::TimeHeldMs() { return state ? System::GetNow() - press_time : 0; }
 }  // namespace daisy
