@@ -124,12 +124,12 @@ enum SetupItem {
     SETUP_BACK, SETUP_REVERB, SETUP_DIR_A, SETUP_DIR_B, SETUP_DIR_C, SETUP_DIR_D,
     SETUP_PAN_A, SETUP_PAN_B, SETUP_PAN_C, SETUP_PAN_D, SETUP_SNAP, SETUP_GATE2,
     SETUP_DUB_FADE, SETUP_DECAY, SETUP_AGE, SETUP_WOW, SETUP_LATCH, SETUP_INPUT, SETUP_MONITOR,
-    SETUP_CLEAR, NUM_SETUP_ITEMS
+    SETUP_CPU, SETUP_CLEAR, NUM_SETUP_ITEMS
 };
 const char *setup_names[NUM_SETUP_ITEMS] = {
     "< Pages", "Reverb", "Dir A", "Dir B", "Dir C", "Dir D", "Pan A", "Pan B",
     "Pan C", "Pan D", "Snap", "Gate 2", "Dub fade", "Decay", "Age", "Wow", "Latch after", "Input",
-    "Monitor", "Clear loop"
+    "Monitor", "CPU load", "Clear loop"
 };
 
 // SETUP settings saved to QSPI flash. Changing this struct means bumping
@@ -200,6 +200,12 @@ volatile float head_window_length[kNumHeads];
 volatile bool record_toggle_requested = false;
 volatile bool clear_requested = false;
 volatile int requested_page = PAGE_MIX;
+// Audio callback load, shown read-only on SETUP: average, peak over the last
+// second, and highest peak since power-up (a click on the item resets it)
+CpuLoadMeter cpu_meter;
+float cpu_recent_peak = 0.f;
+float cpu_highest_peak = 0.f;
+uint32_t cpu_last_reset_millis = 0;
 
 // Knob pickup, owned by the audio callback (see UpdateKnobs)
 int active_page = PAGE_MIX;
@@ -478,6 +484,7 @@ void ResetReverb() {
 //   3. Per sample: input mix -> record/overdub write -> heads -> reverb -> outputs
 //   4. CV and gate outputs
 void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, size_t size) {
+    cpu_meter.OnBlockStart();
     patch.ProcessAnalogControls();
     patch.encoder.Debounce();
     enc_delta_pending += patch.encoder.Increment();
@@ -801,6 +808,7 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, s
         patch.seed.dac.WriteValue(DacHandle::Channel::TWO, 0);
     }
     patch.gate_output.Write(playing && System::GetNow() - last_loop_start_millis < kLoopPulseMillis);
+    cpu_meter.OnBlockEnd();
 }
 
 // ---------------------------------------------------------------------------
@@ -933,6 +941,8 @@ void OnEncoderClick() {
                 ui_mode = UI_PAGES;
             } else if (setup_item == SETUP_CLEAR) {
                 clear_requested = true;
+            } else if (setup_item == SETUP_CPU) {
+                cpu_highest_peak = cpu_recent_peak; // Read-only; a click resets the max
             } else if (setup_item == SETUP_INPUT || setup_item == SETUP_MONITOR
                        || setup_item == SETUP_DECAY) {
                 AdjustSetupValue(1); // Toggles
@@ -1072,6 +1082,10 @@ void SetupValueText(int item, char *text, size_t size) {
         case SETUP_WOW: snprintf(text, size, "%d%%", tape_wow); break;
         case SETUP_INPUT: snprintf(text, size, "%s", stereo_input ? "Stereo" : "Mono"); break;
         case SETUP_MONITOR: snprintf(text, size, "%s", monitor ? "On" : "Off"); break;
+        case SETUP_CPU:
+            snprintf(text, size, "%d%% pk%d mx%d", (int)(cpu_meter.GetAvgCpuLoad() * 100 + 0.5f),
+                     (int)(cpu_recent_peak * 100 + 0.5f), (int)(cpu_highest_peak * 100 + 0.5f));
+            break;
         case SETUP_LATCH:
             if (latch_loops == 0) snprintf(text, size, "Never");
             else snprintf(text, size, "%d loop%s", latch_loops, latch_loops == 1 ? "" : "s");
@@ -1212,7 +1226,7 @@ void DrawScreen() {
             snprintf(text, sizeof(text), "> %s", setup_names[setup_item]);
             d.SetCursor(1, kLabelY);
             d.WriteString(text, Font_6x8, true);
-            char value[16];
+            char value[20];
             SetupValueText(setup_item, value, sizeof(value));
             bool editing = ui_mode == UI_SETUP_EDIT;
             if (editing) {
@@ -1224,6 +1238,19 @@ void DrawScreen() {
     }
 
     d.Update();
+}
+
+// Tracks the 1-second peak and the highest peak for the SETUP "CPU load" item
+void UpdateCpuMeter(uint32_t now) {
+    float peak = cpu_meter.GetMaxCpuLoad();
+    if (now - cpu_last_reset_millis >= 1000) {
+        cpu_recent_peak = peak;
+        cpu_meter.Reset();
+        cpu_last_reset_millis = now;
+    } else if (peak > cpu_recent_peak) {
+        cpu_recent_peak = peak;
+    }
+    cpu_highest_peak = std::max(cpu_highest_peak, cpu_recent_peak);
 }
 
 // Startup: hardware, clear SDRAM, reverb, settings, knobs, then audio. The main
@@ -1253,6 +1280,7 @@ int main(void) {
         page_value[PAGE_MIX][k] = last_knob[k];
     }
 
+    cpu_meter.Init(patch.AudioSampleRate(), patch.AudioBlockSize());
     patch.StartAudio(AudioCallback);
 
     while (1) {
@@ -1260,6 +1288,7 @@ int main(void) {
         SaveSettingsIfNeeded();
 
         uint32_t now = System::GetNow();
+        UpdateCpuMeter(now);
         // The loop can change whenever it plays (latched DUB, momentary punch-ins,
         // Decay: Always), so redraw it regularly
         bool playing_now = loop_state == LOOP_PLAYING || loop_state == LOOP_OVERDUB;

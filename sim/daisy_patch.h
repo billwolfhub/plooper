@@ -24,6 +24,10 @@ struct DacHandle {
     int WriteValue(Channel, uint16_t) { return 0; }
 };
 struct QSPIHandle {};
+struct CpuLoadMeter {
+    void Init(float, size_t) {} void OnBlockStart() {} void OnBlockEnd() {} void Reset() {}
+    float GetAvgCpuLoad() { return 0.f; } float GetMaxCpuLoad() { return 0.f; }
+};
 struct GPIO { bool state = false; void Write(bool s) { state = s; } };
 struct GateIn { bool high = false; bool State() { return high; } bool Trig() { return false; } };
 struct Encoder {
@@ -49,7 +53,7 @@ class DaisyPatch {
     enum GateInput { GATE_IN_1, GATE_IN_2, GATE_IN_LAST };
     float knobs[4] = {0, 0, 0, 0};
     Seed seed; Encoder encoder; GateIn gate_input[2]; GPIO gate_output; Display display;
-    void Init() {} float AudioSampleRate() { return 48000.f; }
+    void Init() {} float AudioSampleRate() { return 48000.f; } size_t AudioBlockSize() { return 48; }
     void StartAdc() {} void StartAudio(AudioHandle::AudioCallback) {}
     void ProcessAnalogControls() {}
     float GetKnobValue(Ctrl k) { return knobs[k]; }
