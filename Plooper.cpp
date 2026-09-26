@@ -5,6 +5,30 @@
 // level, speed (reverse below zero), start, window length, direction mode,
 // and pan. The heads feed a reverb with six modes, including reversed tails
 // and pitch-shifted feedback.
+//
+// Signal flow (per sample):
+//
+//   IN 1-4 -> levels (INPUT page) -> DC block -> first take / overdub write
+//                                             \-> monitor --------------+
+//   tape (loop_buffer) -> heads A-D -> pan -> sum ----------------------+-> limiter -> OUT 1/2
+//                                             \-> DC block -> reverb --+
+//                                                  ^   (+ pitched      \-> limiter -> OUT 3/4
+//                                                  |    feedback)
+//                                                  +-- shimmer / reverse / freeze
+//
+// There is one tape and four heads reading it; the tape is rewritten at
+// `master_position` (a speed-1 "record head") while overdubbing, and on every
+// pass with Decay: Always, which is where fading and aging happen.
+//
+// Threads: everything that touches audio, the looper state, knob pickup, gates,
+// and the encoder's press edges runs in AudioCallback (48-sample blocks, 1 kHz).
+// The main loop handles the encoder menu, holds that need timing (latching
+// DUB), the display, and saving settings. They talk through `volatile` flags
+// (the UI requests, the audio callback acts), so the audio callback can
+// interrupt the main loop at any point without tearing state.
+//
+// Memory: the 60 s stereo tape and the reverb, pitch shifter, pre-delay, and
+// reverse buffers live in SDRAM, which isn't zeroed at boot (see main()).
 
 #include <algorithm>
 #include <cstdio>
@@ -32,13 +56,13 @@ const uint32_t kSettingsSaveDelayMillis = 2000;
 // Separate from other firmwares' settings (grainwaves 0x7F0000, edges 0x7E0000)
 const uint32_t kSettingsQspiOffset = 0x7D0000;
 const uint32_t kSettingsVersion = 0x9100C004;
-const float kPickupTolerance = 0.02f;
+const float kPickupTolerance = 0.02f; // A knob this close to a stored value picks it up
 
 DaisyPatch patch;
 float sample_rate = 48000.f;
 
 // ---------------------------------------------------------------------------
-// Buffers (SDRAM)
+// Buffers (SDRAM, ~25 MB of 64 MB)
 
 float DSY_SDRAM_BSS loop_buffer[2][kMaxLoopSamples];
 float DSY_SDRAM_BSS reverse_buffer[2][kReverseBufferSamples];
@@ -49,6 +73,8 @@ DelayLine<float, kPreDelaySamples> DSY_SDRAM_BSS pre_delay[2];
 // ---------------------------------------------------------------------------
 // Settings
 
+// Pages the encoder turns through. The first six are knob pages: each knob
+// sets one parameter for one column (IN 1-4, heads A-D, or the FX controls).
 enum Page { PAGE_INPUT, PAGE_MIX, PAGE_SPEED, PAGE_START, PAGE_LENGTH, PAGE_FX, PAGE_SETUP, NUM_PAGES };
 const int kNumKnobPages = PAGE_SETUP;
 const char *page_names[NUM_PAGES] = { "INPUT", "MIX", "SPEED", "START", "LENGTH", "FX", "SETUP" };
@@ -68,7 +94,8 @@ const char *snap_names[NUM_SNAPS] = { "Off", "Octaves", "Musical" };
 enum Gate2Mode { GATE2_REVERSE, GATE2_RETRIGGER, GATE2_SCATTER, GATE2_DUB, NUM_GATE2_MODES };
 const char *gate2_names[NUM_GATE2_MODES] = { "Reverse", "Retrig", "Scatter", "Dub" };
 
-// Knob page values, stored as knob positions 0..1
+// Knob page values, stored as raw knob positions 0..1 and converted to real
+// units where they're used (SpeedFromKnob, LengthFraction, ...). Not saved.
 float page_value[kNumKnobPages][kNumHeads] = {
     { 1.f, 1.f, 0.f, 0.f }, // INPUT: levels of IN 1-4 into the loop and monitor
     { 0.8f, 0.f, 0.f, 0.f }, // MIX: only head A audible at first
@@ -88,11 +115,11 @@ int dub_fade = 0; // Percent the loop fades on each pass while it's rewritten
 bool decay_always = false; // Tape: fade on every pass in PLAY too, not just DUB
 int tape_age = 0; // Tape: 0-100, each rewritten pass gets darker and saturated
 int tape_wow = 0; // Tape: 0-100, slow wobble and flutter on the heads
-bool stereo_input = false; // false: IN 1 + IN 2 mixed to both channels
+bool stereo_input = false; // false: IN 1-4 mixed to both channels
 bool monitor = true; // Pass the input to OUT 1/2
 int latch_loops = 2; // Holding a punch this many loops latches DUB (0 = never)
 
-// SETUP page items
+// SETUP page items, in menu order
 enum SetupItem {
     SETUP_BACK, SETUP_REVERB, SETUP_DIR_A, SETUP_DIR_B, SETUP_DIR_C, SETUP_DIR_D,
     SETUP_PAN_A, SETUP_PAN_B, SETUP_PAN_C, SETUP_PAN_D, SETUP_SNAP, SETUP_GATE2,
@@ -105,6 +132,8 @@ const char *setup_names[NUM_SETUP_ITEMS] = {
     "Monitor", "Clear loop"
 };
 
+// SETUP settings saved to QSPI flash. Changing this struct means bumping
+// kSettingsVersion, so an older saved layout is ignored instead of misread.
 struct Settings {
     uint32_t version;
     int32_t reverb_mode;
@@ -120,6 +149,8 @@ struct Settings {
     bool monitor;
     int32_t latch_loops;
 
+    // PersistentStorage only writes flash when this reports a change.
+    // CurrentSettings() zeroes padding so the byte comparison is reliable.
     bool operator!=(const Settings &other) const {
         return memcmp(this, &other, sizeof(Settings)) != 0;
     }
@@ -131,6 +162,8 @@ uint32_t last_settings_change_millis = 0;
 // ---------------------------------------------------------------------------
 // Looper state
 
+// EMPTY -> RECORDING (first take) -> PLAYING <-> OVERDUB, via ToggleRecording().
+// Momentary punch-ins stay in PLAYING; `dub_amount` does the recording.
 enum LoopState { LOOP_EMPTY, LOOP_RECORDING, LOOP_PLAYING, LOOP_OVERDUB };
 const char *state_names[] = { "EMPTY", "REC", "PLAY", "DUB" };
 
@@ -150,6 +183,9 @@ volatile int record_position = 0; // Write position during the first take
 volatile int master_position = 0; // Speed-1 position, used for overdub and outputs
 uint32_t last_loop_start_millis = 0;
 
+// A head plays a window of the tape: it starts at START (fraction of the loop),
+// spans LENGTH, and wraps, bounces, or jumps inside it. `position` is relative
+// to the window start, in samples, and fractional for varispeed.
 struct Head {
     float position = 0.f; // Offset within the head's window
     float bounce = 1.f; // Pingpong direction
@@ -165,7 +201,7 @@ volatile bool record_toggle_requested = false;
 volatile bool clear_requested = false;
 volatile int requested_page = PAGE_MIX;
 
-// Knob pickup, owned by the audio callback
+// Knob pickup, owned by the audio callback (see UpdateKnobs)
 int active_page = PAGE_MIX;
 bool knob_caught[kNumHeads] = { true, true, true, true };
 float last_knob[kNumHeads] = { 0, 0, 0, 0 };
@@ -197,12 +233,14 @@ struct DcBlocker {
 };
 DcBlocker input_dc_blocker[2];
 DcBlocker send_dc_blocker[2];
+// Reverse-tail readers (see ReverseProcess): each plays one window backwards
+// from where the write position was when its window began
 struct ReverseReader {
-    int start = 0;
-    int phase = 0;
+    int start = 0; // Write position when this reader's window began
+    int phase = 0; // Samples into the window
 };
 int reverse_write = 0;
-ReverseReader reverse_reader[2];
+ReverseReader reverse_reader[2]; // Half a window apart, crossfaded
 
 // Tape aging: one-pole lowpass state along the loop, per channel
 float age_lowpass[2] = { 0.f, 0.f };
@@ -224,7 +262,9 @@ uint32_t last_screen_update_millis = 0;
 // ---------------------------------------------------------------------------
 // Helpers
 
-// Transparent below the knee, then rounds peaks off smoothly toward +/-1
+// Transparent below the knee, then rounds peaks off smoothly toward +/-1.
+// Used on every output and on overdub writes. It's a static curve (no attack or
+// release), so it can't pump, but a hugely hot signal is flattened toward 1.
 inline float PeakLimit(float x) {
     const float knee = 0.8f;
     float magnitude = fabsf(x);
@@ -236,6 +276,9 @@ inline float PeakLimit(float x) {
     return x < 0.f ? -limited : limited;
 }
 
+// Soft clipper (rational tanh approximation), exactly +/-1 beyond +/-3. Colors
+// even moderate levels, so it's used where saturation is the point: the
+// reverb send and tape Age.
 inline float Saturate(float x) {
     if (x > 3.f) return 1.f;
     if (x < -3.f) return -1.f;
@@ -247,6 +290,8 @@ inline int WrapIndex(int index, int length) {
     return index < 0 ? index + length : index;
 }
 
+// Reads the tape at a fractional position with linear interpolation, wrapping
+// around the loop (heads can point anywhere, including past the end)
 inline float ReadLoop(int channel, float index) {
     int length = loop_length;
     int i0 = (int)floorf(index);
@@ -258,6 +303,8 @@ inline float ReadLoop(int channel, float index) {
 }
 
 // Knob 0..1 -> speed: left half reverse, right half forward, 0.25x..2x each way
+// (exponential, so equal knob distances are equal musical intervals). Snap
+// picks the nearest allowed ratio in pitch terms (log2).
 float SpeedFromKnob(float knob) {
     float t = fabsf(knob - 0.5f) * 2.f;
     float speed = 0.25f * powf(8.f, t);
@@ -285,6 +332,8 @@ inline float LengthFraction(float knob) {
 // ---------------------------------------------------------------------------
 // Looper control (audio callback)
 
+// Steps the looper state machine. Called from the audio callback only (for the
+// encoder press, GATE IN 1, UI requests, and a full buffer).
 void ToggleRecording() {
     switch (loop_state) {
         case LOOP_EMPTY:
@@ -293,8 +342,9 @@ void ToggleRecording() {
             loop_state = LOOP_RECORDING;
             break;
         case LOOP_RECORDING: {
+            // Close the loop: its length is however much was recorded
             int length = record_position;
-            if (length < kMinLoopSamples) {
+            if (length < kMinLoopSamples) { // Too short to be a loop: discard
                 loop_state = LOOP_EMPTY;
                 break;
             }
@@ -334,7 +384,11 @@ void ClearLoop() {
     waveform_dirty = true;
 }
 
-// Page changes and knob pickup: a knob takes over a value once it reaches it
+// Page changes and knob pickup. Each page stores its own four values, but there
+// are only four physical knobs, so after a page change a knob doesn't take over
+// until it reaches the stored value: either it's already within tolerance, or
+// it has crossed the value since the last block (the sign of knob - value
+// flipped). Until then the display shows a dot next to that value.
 void UpdateKnobs() {
     int page = requested_page;
     if (page != active_page) {
@@ -367,6 +421,11 @@ void UpdateKnobs() {
 // Reverb
 
 // Plays the last `window` samples backwards with two overlapping readers
+// (a classic reverse delay). Each reader starts at the current write position
+// and walks backwards through the window just recorded, under a Hann envelope;
+// the second reader runs half a window behind, and two Hann windows half a
+// period apart sum to a constant, so the output doesn't pulse. Reading
+// backwards while writing forwards needs 2x the window in buffer.
 float ReverseProcess(int channel, float input, int window) {
     reverse_buffer[channel][reverse_write] = input;
     float out = 0.f;
@@ -380,6 +439,8 @@ float ReverseProcess(int channel, float input, int window) {
     return out;
 }
 
+// Steps both readers and the write position (once per sample, after both
+// channels have been processed)
 void AdvanceReverse(int window) {
     ReverseReader &first = reverse_reader[0];
     ReverseReader &second = reverse_reader[1];
@@ -411,6 +472,11 @@ void ResetReverb() {
 // ---------------------------------------------------------------------------
 // Audio
 
+// Runs every 48 samples (1 kHz). Order:
+//   1. Controls: encoder edges (acted on immediately), knobs/pickup, gates, UI requests
+//   2. Per-block parameters: heads, reverb, tape, input levels
+//   3. Per sample: input mix -> record/overdub write -> heads -> reverb -> outputs
+//   4. CV and gate outputs
 void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, size_t size) {
     patch.ProcessAnalogControls();
     patch.encoder.Debounce();
@@ -445,7 +511,8 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, s
 
     UpdateKnobs();
 
-    // Record button: GATE IN 1 trigger or encoder hold
+    // GATE IN 1 triggers step the state machine; the UI requests steps too
+    // (latching DUB after a long hold, a click leaving DUB)
     bool gate1 = patch.gate_input[DaisyPatch::GATE_IN_1].State();
     if ((gate1 && !gate1_state) || record_toggle_requested) {
         record_toggle_requested = false;
@@ -479,8 +546,7 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, s
         head_window_start[h] = window_start[h];
         head_window_length[h] = window_length[h];
 
-        // Equal-power pan
-        float p = (pan[h] + 100) / 200.f;
+        float p = (pan[h] + 100) / 200.f; // 0 = left, 1 = right
         // Balance-style pan: centre is full level on both sides, never louder
         gain_l[h] = level[h] * std::min(1.f, 2.f * (1.f - p));
         gain_r[h] = level[h] * std::min(1.f, 2.f * p);
@@ -494,7 +560,9 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, s
         }
     }
 
-    // Reverb parameters
+    // Reverb parameters (FX page: MIX, DECAY, TONE, ODD). ODD ("strange") means
+    // something different in each mode: pre-delay, shimmer amount, reverse
+    // window, or freeze fill rate.
     float fx_mix = page_value[PAGE_FX][0] * 2.f; // Makes up for kReverbSendLevel
     const float dc_coefficient = 1.f - 2.f * PI_F * 10.f / sample_rate;
     float decay = page_value[PAGE_FX][1];
@@ -526,7 +594,8 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, s
         pre_delay[0].SetDelay(delay);
         pre_delay[1].SetDelay(delay);
     }
-    // Dubbing: DUB state, or GATE IN 2 held high in PLAY with Gate 2 set to Dub
+    // Dubbing: DUB state, or a momentary punch-in (encoder held, or GATE IN 2
+    // high with Gate 2 set to Dub) while in PLAY
     bool punch = loop_state == LOOP_PLAYING
         && ((gate2_mode == GATE2_DUB && gate2) || encoder_punch);
     punching_in = punch;
@@ -566,7 +635,8 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, s
         float in_l = input_dc_blocker[0].Process(mix_l, dc_coefficient);
         float in_r = input_dc_blocker[1].Process(mix_r, dc_coefficient);
 
-        // Recording
+        // Recording: the first take writes straight in (fading in over the first
+        // 5 ms); afterwards the tape is rewritten at the speed-1 master position
         if (loop_state == LOOP_RECORDING) {
             int pos = record_position;
             float fade_in = std::min(1.f, (float)pos / kEdgeFadeSamples);
@@ -586,6 +656,7 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, s
             // With Decay: Dub only, the loop fades only while dubbing
             float keep = 1.f - fade * (decay_always ? 1.f : dub_amount);
             for (int c = 0; c < 2; c++) {
+                // new = aged(old) * keep + input * dub_amount
                 float old = loop_buffer[c][pos];
                 if (age > 0.f) {
                     // Filtering along the loop darkens it a little more each pass
@@ -610,7 +681,8 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, s
                 + flutter_depth * sinf(2.f * PI_F * flutter_phase);
         }
 
-        // Playheads
+        // Playheads: read, fade at the window edges (so wrapping doesn't click),
+        // pan, then advance and handle the window boundary per direction mode
         float heads_l = 0.f, heads_r = 0.f;
         if (playing) {
             for (int h = 0; h < kNumHeads; h++) {
@@ -628,16 +700,16 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, s
                 head.position += speed[h] * head.bounce * wobble;
                 if (head.position >= wl || head.position < 0.f) {
                     switch (direction[h]) {
-                        case DIR_PINGPONG:
+                        case DIR_PINGPONG: // Reflect off the edge and reverse
                             head.bounce = -head.bounce;
                             head.position = head.position >= wl
                                 ? std::max(0.f, 2.f * wl - head.position - 1.f)
                                 : std::min(wl - 1.f, -head.position);
                             break;
-                        case DIR_RANDOM:
+                        case DIR_RANDOM: // Jump somewhere new in the window
                             head.position = rand() * kRandFrac * wl;
                             break;
-                        default:
+                        default: // Forward/Reverse: wrap around the window
                             head.position = fmodf(head.position, wl);
                             if (head.position < 0.f) head.position += wl;
                             break;
@@ -645,6 +717,8 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, s
                 }
             }
 
+            // The master position always moves at speed 1: it's where overdubs
+            // and fading are written, and what CV OUT 2 and GATE OUT follow
             int next = master_position + 1;
             if (next >= length) {
                 next = 0;
@@ -653,7 +727,8 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, s
             master_position = next;
         }
 
-        // Reverb
+        // Reverb: send the heads (DC-blocked, with headroom) plus any pitched
+        // feedback, soft-clipped so nothing can overload the reverb input
         float send_l = Saturate(send_dc_blocker[0].Process(heads_l, dc_coefficient) * input_gain * kReverbSendLevel
             + shimmer_feedback * shimmer_amount);
         float send_r = Saturate(send_dc_blocker[1].Process(heads_r, dc_coefficient) * input_gain * kReverbSendLevel
@@ -666,6 +741,9 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, s
         }
         float wet_l, wet_r;
         reverb.Process(send_l, send_r, &wet_l, &wet_r);
+        // Track the wet level; Shimmer/Sub/Ghost and Freeze turn their feedback
+        // or input down as it approaches kShimmerTargetLevel, so they level off
+        // instead of running away to full scale
         float mono = 0.5f * (wet_l + wet_r);
         float level = fabsf(mono);
         wet_envelope += (level > wet_envelope ? envelope_attack : envelope_release)
@@ -726,7 +804,8 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, s
 }
 
 // ---------------------------------------------------------------------------
-// Settings persistence
+// Settings persistence: SETUP settings are saved to the end of the QSPI flash
+// (far from the app at 0x90040000) a couple of seconds after the last change
 
 Settings CurrentSettings() {
     Settings s;
@@ -749,6 +828,8 @@ Settings CurrentSettings() {
     return s;
 }
 
+// The globals' initial values are the defaults. A saved layout from another
+// version is ignored, and every value is range-checked before it's used.
 void LoadSettings() {
     settings_storage.Init(CurrentSettings(), kSettingsQspiOffset);
     Settings &s = settings_storage.GetSettings();
@@ -789,6 +870,9 @@ void SaveSettingsIfNeeded() {
 // ---------------------------------------------------------------------------
 // UI
 
+// UI_PAGES: turning changes page. On the SETUP page a click enters UI_SETUP_NAV
+// (turning picks an item); a click on an item enters UI_SETUP_EDIT (turning
+// changes it) or, for on/off items and actions, applies it directly.
 enum UiMode { UI_PAGES, UI_SETUP_NAV, UI_SETUP_EDIT };
 int ui_mode = UI_PAGES;
 int page = PAGE_MIX;
@@ -862,6 +946,8 @@ void OnEncoderClick() {
     }
 }
 
+// Main-loop half of the encoder: takes the events the audio callback latched,
+// times holds, handles clicks and turns, and the SETUP timeout
 void UpdateUi() {
     __disable_irq();
     int enc = enc_delta_pending;
@@ -939,7 +1025,12 @@ void UpdateUi() {
 }
 
 // ---------------------------------------------------------------------------
-// Display
+// Display (128 x 64):
+//   y 0-7    page name, input meter (+ clip block), looper state and length
+//   y 8      latch progress bar while a punch is held
+//   y 9-26   waveform, with the master position as a vertical line
+//   y 28-43  one lane per head: its window (dotted if muted) and position
+//   y 46-63  the page's four labels and values, or the SETUP item
 
 const int kWaveTop = 9;
 const int kWaveBottom = 26;
@@ -947,6 +1038,8 @@ const int kLaneTop = 28;
 const int kLabelY = 46;
 const int kValueY = 56;
 
+// Rebuilds the waveform overview from the tape (peak per screen column,
+// sampling every 64th sample, which is plenty for one pixel)
 void RefreshWaveform() {
     int length = loop_length;
     memset(waveform, 0, sizeof(waveform));
@@ -1034,7 +1127,7 @@ void DrawScreen() {
     int state = loop_state;
     float seconds = (state == LOOP_RECORDING ? record_position : loop_length) / sample_rate;
     if (state == LOOP_PLAYING && punching_in) {
-        state = LOOP_OVERDUB; // Gate 2 punch-in shows as DUB
+        state = LOOP_OVERDUB; // Momentary punch-ins show as DUB
     }
     if (state == LOOP_EMPTY) {
         snprintf(text, sizeof(text), "%s", state_names[state]);
@@ -1133,6 +1226,8 @@ void DrawScreen() {
     d.Update();
 }
 
+// Startup: hardware, clear SDRAM, reverb, settings, knobs, then audio. The main
+// loop runs the UI, saves settings, and redraws the waveform and screen.
 int main(void) {
     patch.Init();
     sample_rate = patch.AudioSampleRate();
@@ -1148,7 +1243,8 @@ int main(void) {
 
     LoadSettings();
 
-    // Knobs start caught on the first page
+    // Knobs start caught on the MIX page: its values take the physical knob
+    // positions, so turning a knob does something straight away
     patch.StartAdc();
     System::Delay(20);
     patch.ProcessAnalogControls();
