@@ -130,9 +130,16 @@ sim/run.sh 0 1          # no DC offset, Shimmer
 sim/run.sh 0.05 4 stress  # DC offset, Ghost, four heads full, DECAY/ODD max
 ```
 
+## License
+
+Plooper is released under the [MIT License](LICENSE). It builds against
+[libDaisy](https://github.com/electro-smith/libDaisy) (MIT) and
+[DaisySP](https://github.com/electro-smith/DaisySP) (MIT), and uses ReverbSc from
+[DaisySP-LGPL](https://github.com/electro-smith/DaisySP-LGPL) (LGPL-2.1).
+
 ## Building
 
-Needs `libDaisy` and `DaisySP` (with `DaisySP-LGPL` built) one folder up.
+Needs [libDaisy](https://github.com/electro-smith/libDaisy) and [DaisySP](https://github.com/electro-smith/DaisySP) (with its `DaisySP-LGPL` submodule built) cloned next to this repository, one folder up.
 
 ```sh
 make
