@@ -24,7 +24,6 @@ const int kEdgeFadeSamples = 240; // 5 ms fades at window edges and take ends
 const int kReverseBufferSamples = 48000 * 16 / 5; // 3.2 s, twice the longest reverse window
 const int kPreDelaySamples = 24000; // 500 ms
 const uint32_t kLoopPulseMillis = 5;
-const uint32_t kEncoderHoldMillis = 1000;
 const uint32_t kLatchMinimumMillis = 4000; // Shortest hold that latches DUB
 const uint32_t kSetupTimeoutMillis = 6000; // Idle time before SETUP returns to play
 const uint32_t kScreenUpdateMillis = 16;
@@ -140,6 +139,10 @@ volatile float input_meter = 0.f; // Recent input peak, 0..1
 float dub_amount = 0.f; // 0..1, ramps so dubbing punches in and out without clicks
 volatile bool punching_in = false; // A momentary dub is active, for the display
 volatile bool encoder_punch = false; // Encoder held for a punch-in (set in the audio callback)
+// What the current encoder press does, decided by the audio callback from the
+// looper state at the moment of the press
+enum PressAction { PRESS_CLICK, PRESS_RECORD, PRESS_PUNCH, PRESS_LEAVE_DUB };
+volatile int press_action = PRESS_CLICK;
 volatile float latch_progress = -1.f; // 0..1 while a punch heads toward latching DUB, else < 0
 volatile uint32_t last_input_clip_millis = 0;
 volatile int loop_length = 0;
@@ -413,11 +416,27 @@ void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, s
     patch.encoder.Debounce();
     enc_delta_pending += patch.encoder.Increment();
     if (patch.encoder.RisingEdge()) {
-        enc_rise_pending = true;
-        // Punch in on the press itself, on the play pages while the loop plays
-        if (requested_page != PAGE_SETUP && loop_state == LOOP_PLAYING) {
-            encoder_punch = true;
+        // Act on the press itself (not the release) so takes and punch-ins land on
+        // the beat. On the SETUP page presses are only clicks.
+        if (requested_page == PAGE_SETUP) {
+            press_action = PRESS_CLICK;
+        } else {
+            switch (loop_state) {
+                case LOOP_EMPTY:
+                case LOOP_RECORDING:
+                    press_action = PRESS_RECORD;
+                    ToggleRecording(); // Start the first take, or close the loop
+                    break;
+                case LOOP_PLAYING:
+                    press_action = PRESS_PUNCH;
+                    encoder_punch = true;
+                    break;
+                default:
+                    press_action = PRESS_LEAVE_DUB; // Acts on release
+                    break;
+            }
         }
+        enc_rise_pending = true;
     }
     if (patch.encoder.FallingEdge()) {
         enc_fall_pending = true;
@@ -778,8 +797,6 @@ uint32_t last_encoder_activity_millis = 0;
 int setup_item = SETUP_REVERB;
 bool encoder_press_armed = false;
 bool encoder_hold_fired = false;
-enum PressAction { PRESS_CLICK, PRESS_RECORD, PRESS_PUNCH, PRESS_LEAVE_DUB };
-int press_action = PRESS_CLICK; // What the current encoder press does
 
 inline int Wrap(int value, int count) {
     return ((value % count) + count) % count;
@@ -855,33 +872,21 @@ void UpdateUi() {
     enc_fall_pending = false;
     __enable_irq();
 
-    // Encoder presses on the play pages:
-    //   EMPTY / REC: hold 1 s to start or close the first take
+    // Encoder presses on the play pages (the audio callback acts on the press):
+    //   EMPTY / REC: a press starts the first take / closes the loop
     //   PLAY: records while held (the audio callback punches in on the press);
     //         holding past `Latch after` loops (4 s minimum) latches DUB
     //   DUB: a click goes back to PLAY
     // On the SETUP page every press is a click, so navigating can't dub.
     if (enc_rise) {
         encoder_press_armed = true;
-        encoder_hold_fired = false;
-        int state = loop_state;
-        if (page == PAGE_SETUP) {
-            press_action = PRESS_CLICK;
-        } else if (state == LOOP_PLAYING) {
-            press_action = PRESS_PUNCH;
-        } else if (state == LOOP_OVERDUB) {
-            press_action = PRESS_LEAVE_DUB;
-        } else {
-            press_action = PRESS_RECORD;
-        }
+        // Recording presses already acted in the audio callback
+        encoder_hold_fired = press_action == PRESS_RECORD;
     }
     latch_progress = -1.f;
     if (encoder_press_armed && !encoder_hold_fired && patch.encoder.Pressed()) {
         uint32_t held = patch.encoder.TimeHeldMs();
-        if (press_action == PRESS_RECORD && held >= kEncoderHoldMillis) {
-            encoder_hold_fired = true;
-            record_toggle_requested = true;
-        } else if (press_action == PRESS_PUNCH && latch_loops > 0 && loop_length > 0) {
+        if (press_action == PRESS_PUNCH && latch_loops > 0 && loop_length > 0) {
             float loop_millis = loop_length / sample_rate * 1000.f;
             float threshold = std::max((float)kLatchMinimumMillis, loop_millis * latch_loops);
             latch_progress = std::min(1.f, held / threshold);

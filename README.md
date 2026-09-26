@@ -12,8 +12,8 @@ feed a reverb with six modes, including reversed tails and pitch-shifted feedbac
 
 | State | Press | Result |
 |---|---|---|
-| EMPTY | Hold 1 s | Start the first take (REC) |
-| REC | Hold 1 s | Close the loop → PLAY |
+| EMPTY | Press | **Starts the first take** the moment you press |
+| REC | Press | **Closes the loop** the moment you press → PLAY (the loop length is exactly the time between presses) |
 | PLAY | Press and hold | **Records while held**, from the instant you press (10 ms fades, no clicks). The header shows DUB. |
 | PLAY | Keep holding past `Latch after` (default 2 loops, at least 4 s) | **Latches DUB** — keeps recording after you let go. A bar along the top of the waveform fills as you approach it. |
 | DUB | Click | Back to PLAY |

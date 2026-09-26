@@ -62,6 +62,15 @@ int main(int argc, char** argv) {
     }
     for (int k = 0; k < 4; k++) { patch.knobs[k] = mix[k]; page_value[PAGE_MIX][k] = mix[k]; }
     Run(2, 0.5f, dc, "empty");
+    if (getenv("TAKE")) {
+        // Encoder: press to start, press again 3.5 s after the first press to close
+        patch.encoder.down = true;  Run(0.2f, 0.5f, dc, "press");
+        patch.encoder.down = false; Run(3.3f, 0.5f, dc, "rec");
+        patch.encoder.down = true;  Run(0.2f, 0.5f, dc, "press");
+        patch.encoder.down = false; Run(2, 0.5f, dc, "play");
+        printf("loop length: %d samples = %.4f s (expected 3.5000 s)\n", (int)loop_length, loop_length / 48000.f);
+        return 0;
+    }
     record_toggle_requested = true; Run(4, 0.5f, dc, "rec");
     record_toggle_requested = true; Run(stress ? 30 : 10, 0.5f, dc, "play");
     if (getenv("FADE")) {
