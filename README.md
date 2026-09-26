@@ -95,7 +95,8 @@ On the SETUP page, holding the encoder does nothing special (no punch-in or reco
 Reverb mode, Dir A–D, Pan A–D (−100…+100), Snap (Off / Octaves / Musical: octaves and fifths),
 Gate 2, the Tape settings below, Latch after (1 / 2 / 4 loops / Never), Input (Mono: IN 1–4 mixed to both channels / Stereo: IN 1 + IN 3 left,
 IN 2 + IN 4 right),
-Monitor (On/Off), Clear loop. SETUP settings are saved to flash; knob page values are not.
+Monitor (On/Off), CPU load (read-only: average, peak over the last second, and highest peak since power-up; click to reset
+the highest), Clear loop. SETUP settings are saved to flash; knob page values are not.
 
 ## Tape (Frippertronics)
 
