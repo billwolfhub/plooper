@@ -1,2 +1,4 @@
 build/
 sim/harness
+docs/
+.DS_Store
